@@ -22,13 +22,21 @@ python3 ghost_verify.py file.apk   # start with a file loaded
 ```
 
 1. Pick a file (or pass it on the command line).
-2. It shows SHA-256, MD5, and size, with one-tap copy buttons.
+2. It shows SHA-256, SHA-512, MD5, and size from a single read pass,
+   with one-tap copy buttons.
 3. Paste the expected SHA-256 from the ship note: live verdict —
    **MATCH** (green), **NO MATCH** (red), or "keep pasting" while the
    hash is still partial.
+4. **Copy ship note** puts a ready-to-paste line on the clipboard:
+   `name - size - SHA-256 <hash>`, the format the studio's ship notes use.
+5. **Batch mode** verifies a whole folder against a `SHA256SUMS` file
+   (the format the release branches carry): pick the sums file, pick
+   the folder, get per-file MATCH / DIFFER / MISSING with counts.
 
 Hashing runs on a background thread with a progress readout, so big
-files never freeze the window.
+files never freeze the window. The worker never touches the window
+directly; it posts events the main loop applies (Tk is not
+thread-safe, and the first smoke test here proved why that matters).
 
 ## Notes
 
