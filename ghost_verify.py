@@ -355,7 +355,7 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
     user pastes a URL and asks. Plain GET, no cookies, no auth.
     Display-free.
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.8"})
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.9"})
     fd, path = tempfile.mkstemp(prefix="ghostverify-", suffix=".bin")
     done = 0
     with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out:
@@ -373,6 +373,81 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
             if progress is not None and total:
                 progress(done / total)
     return path
+
+
+def release_report(folder):
+    """Audit a release folder in one pass. Display-free.
+
+    Returns (text, summary): verifies the folder's SHA256SUMS when
+    one is present, profiles every top-level APK, and checks that
+    all APKs share one signer (a folder shipping two signers is a
+    folder whose builds cannot all install over each other).
+    """
+    lines = [f"Release report — {folder}", ""]
+    summary = {"sums": None, "apks": [], "signers": set(), "problems": 0}
+
+    sums_path = None
+    for cand in ("SHA256SUMS", "SHA256SUMS.txt", "sha256sums.txt"):
+        if os.path.isfile(os.path.join(folder, cand)):
+            sums_path = os.path.join(folder, cand)
+            break
+    if sums_path:
+        with open(sums_path, "r", encoding="utf-8", errors="replace") as fh:
+            entries = parse_sums(fh.read())
+        # A sums file sometimes lists itself (it was sitting in the
+        # folder when the sums were generated). Its own entry can
+        # never verify — writing the file changes it — so it is not
+        # a finding; drop it.
+        entries = [(n, h) for n, h in entries
+                   if n != os.path.basename(sums_path)]
+        results = verify_batch(folder, entries)
+        counts = {"match": 0, "differ": 0, "missing": 0}
+        for _n, s in results:
+            counts[s] += 1
+        summary["sums"] = counts
+        summary["problems"] += counts["differ"] + counts["missing"]
+        lines.append(f"SHA256SUMS ({os.path.basename(sums_path)}): "
+                     f"{counts['match']} match · {counts['differ']} differ · "
+                     f"{counts['missing']} missing (of {len(results)})")
+        for name, status in results:
+            if status != "match":
+                lines.append(f"  ! {status.upper()}: {name}")
+    else:
+        lines.append("SHA256SUMS: none found in this folder")
+    lines.append("")
+
+    apk_names = sorted(f for f in os.listdir(folder)
+                       if f.lower().endswith(".apk")
+                       and os.path.isfile(os.path.join(folder, f)))
+    for name in apk_names:
+        prof = file_profile(os.path.join(folder, name))
+        summary["apks"].append(prof)
+        if prof["signer"]:
+            summary["signers"].add(prof["signer"])
+        a = prof["apk"] or {}
+        lines.append(f"{name}")
+        lines.append(f"  {a.get('package', '?')} v{a.get('version_name', '?')} "
+                     f"(code {a.get('version_code', '?')}) · "
+                     f"{len(a.get('permissions', []))} permissions · "
+                     f"{prof['size']:,} bytes")
+        lines.append(f"  SHA-256 {prof['sha256']}")
+        lines.append(f"  Signer  {prof['signer'] or 'no v2/v3 signing block found'}")
+    if not apk_names:
+        lines.append("APKs: none found in this folder")
+    lines.append("")
+
+    if len(summary["signers"]) > 1:
+        summary["problems"] += 1
+        lines.append(f"Signer consistency: INCONSISTENT — {len(summary['signers'])} "
+                     "different signers across the APKs. These builds cannot all "
+                     "install over each other.")
+    elif len(summary["signers"]) == 1:
+        lines.append(f"Signer consistency: one signer across all APKs "
+                     f"({next(iter(summary['signers']))[:16]}…)")
+    lines.append("")
+    lines.append("Verdict: " + ("READY — no problems found" if summary["problems"] == 0
+                                 else f"{summary['problems']} problem(s) to look at"))
+    return "\n".join(lines) + "\n", summary
 
 
 def generate_sums(folder, progress=None, exclude=None):
@@ -423,7 +498,7 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.8 - file hash checker")
+        self.title("Ghost Verify 1.9 - file hash checker")
         self.geometry("660x720")
         self.minsize(580, 620)
         self.configure(bg=BG)
@@ -483,6 +558,8 @@ class GhostVerify(tk.Tk):
                     self.status_var.set(f"Wrote {count} entries to {dest}")
                 elif kind == "compare_done":
                     self.show_compare(payload[0], payload[1])
+                elif kind == "report_done":
+                    self.show_report(payload[0], payload[1])
                 elif kind == "fetch_progress":
                     self.status_var.set(f"Fetching... {int(payload * 100)}%")
                     self.set_progress(payload)
@@ -506,7 +583,7 @@ class GhostVerify(tk.Tk):
         header.pack(fill="x", pady=(12, 0), **pad)
         tk.Label(header, text="GHOST VERIFY", bg=BG, fg=TEXT1,
                  font=("Helvetica", 17, "bold")).pack(side="left")
-        tk.Label(header, text=" 1.8 ", bg=ACCENT, fg="white",
+        tk.Label(header, text=" 1.9 ", bg=ACCENT, fg="white",
                  font=("Helvetica", 9, "bold")).pack(side="left", padx=(10, 0))
         tk.Label(header, text="Ghost Developer Studio", bg=BG, fg=TEXT2,
                  font=("Helvetica", 9)).pack(side="right")
@@ -606,8 +683,13 @@ class GhostVerify(tk.Tk):
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
-        tk.Button(actions, text="Compare APKs",
+        tk.Button(actions, text="Compare files",
                   command=self.start_compare,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
+        tk.Button(actions, text="Release report",
+                  command=self.start_report,
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
@@ -1019,6 +1101,53 @@ class GhostVerify(tk.Tk):
                   font=("Helvetica", 10, "bold"), padx=12, pady=4) \
             .pack(anchor="w", padx=12, pady=(0, 12))
 
+    # ------------------------------------------------------------ release report
+    def start_report(self):
+        folder = filedialog.askdirectory(
+            title="Choose the release folder to audit")
+        if not folder:
+            return
+        self.status_var.set("Auditing the release folder...")
+
+        def work():
+            try:
+                text, summary = release_report(folder)
+                self.events.put(("report_done", (text, summary)))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_report(self, text, summary):
+        self.status_var.set("Release report ready.")
+        self.log_event(f"release report: {summary['problems']} problem(s), "
+                       f"{len(summary['apks'])} APK(s)")
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - release report")
+        win.geometry("680x460")
+        win.configure(bg=BG)
+        verdict = ("READY — no problems found" if summary["problems"] == 0
+                   else f"{summary['problems']} problem(s) to look at")
+        tk.Label(win, text=verdict, bg=BG,
+                 fg=GOOD if summary["problems"] == 0 else BAD,
+                 font=("Helvetica", 12, "bold")) \
+            .pack(anchor="w", padx=12, pady=(12, 6))
+        body = tk.Text(win, bg=SURFACE, fg=TEXT1, relief="flat",
+                       font=("Courier", 9), wrap="word")
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+
+        def copy_report():
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.status_var.set("Release report copied.")
+
+        tk.Button(win, text="Copy report", command=copy_report, bg=ACCENT,
+                  fg="white", activebackground=ACCENT_SOFT, relief="flat",
+                  font=("Helvetica", 10, "bold"), padx=12, pady=4) \
+            .pack(anchor="w", padx=12, pady=(0, 12))
+
     # ------------------------------------------------------------ compare mode
     def start_compare(self):
         old = filedialog.askopenfilename(
@@ -1062,38 +1191,45 @@ class GhostVerify(tk.Tk):
                      font=("Helvetica", 10), anchor="w", wraplength=470,
                      justify="left").grid(row=r, column=1, sticky="w")
 
+        d = cmp_["size_delta"]
         if cmp_["package_match"] is None:
-            row(0, "Package", "At least one file is not a readable APK", BAD)
+            same = old["sha256"] == new["sha256"]
+            row(0, "Files", "IDENTICAL — same SHA-256" if same else "DIFFERENT files",
+                GOOD if same else BAD)
+            row(1, "Size", f"{old['size']:,}  →  {new['size']:,} bytes  ({'+' if d >= 0 else ''}{d:,})")
+            row(2, "SHA (1st)", old["sha256"])
+            row(3, "SHA (2nd)", new["sha256"])
         else:
             row(0, "Package",
                 new["apk"].get("package", "") + ("  (same)" if cmp_["package_match"] else "  — DIFFERENT from the old release"),
                 GOOD if cmp_["package_match"] else BAD)
-        if cmp_["version"]:
-            on, oc, nn, nc = cmp_["version"]
-            arrow = {"upgrade": "▲ upgrade", "same": "= same code — Android will treat this as the same version",
-                     "downgrade": "▼ DOWNGRADE — a lower code will not install over the old one",
-                     "unknown": "?"}[cmp_["direction"]]
-            row(1, "Version", f"v{on} (code {oc})  →  v{nn} (code {nc})   {arrow}",
-                GOOD if cmp_["direction"] == "upgrade" else (TEXT1 if cmp_["direction"] == "same" else BAD))
-        signer_txt = {"same": f"SAME signer ({(new.get('signer') or '')[:16]}…) — installs over the old release",
-                      "different": "DIFFERENT signer — this build will NOT install over the old one",
-                      "unknown": "could not be read on one side"}[cmp_["signer"]]
-        row(2, "Signer", signer_txt, GOOD if cmp_["signer"] == "same" else BAD)
-        pa, pr = cmp_["perms_added"], cmp_["perms_removed"]
-        if pa or pr:
-            bits = []
-            if pa: bits.append("added: " + ", ".join(p.replace("android.permission.", "") for p in pa))
-            if pr: bits.append("removed: " + ", ".join(p.replace("android.permission.", "") for p in pr))
-            row(3, "Perms", " · ".join(bits), TEXT1)
-        else:
-            row(3, "Perms", "unchanged", GOOD)
-        d = cmp_["size_delta"]
-        row(4, "Size", f"{old['size']:,}  →  {new['size']:,} bytes  ({'+' if d >= 0 else ''}{d:,})")
-        row(5, "New SHA", new["sha256"])
+            if cmp_["version"]:
+                on, oc, nn, nc = cmp_["version"]
+                arrow = {"upgrade": "▲ upgrade", "same": "= same code — Android will treat this as the same version",
+                         "downgrade": "▼ DOWNGRADE — a lower code will not install over the old one",
+                         "unknown": "?"}[cmp_["direction"]]
+                row(1, "Version", f"v{on} (code {oc})  →  v{nn} (code {nc})   {arrow}",
+                    GOOD if cmp_["direction"] == "upgrade" else (TEXT1 if cmp_["direction"] == "same" else BAD))
+            signer_txt = {"same": f"SAME signer ({(new.get('signer') or '')[:16]}…) — installs over the old release",
+                          "different": "DIFFERENT signer — this build will NOT install over the old one",
+                          "unknown": "could not be read on one side"}[cmp_["signer"]]
+            row(2, "Signer", signer_txt, GOOD if cmp_["signer"] == "same" else BAD)
+            pa, pr = cmp_["perms_added"], cmp_["perms_removed"]
+            if pa or pr:
+                bits = []
+                if pa: bits.append("added: " + ", ".join(p.replace("android.permission.", "") for p in pa))
+                if pr: bits.append("removed: " + ", ".join(p.replace("android.permission.", "") for p in pr))
+                row(3, "Perms", " · ".join(bits), TEXT1)
+            else:
+                row(3, "Perms", "unchanged", GOOD)
+            row(4, "Size", f"{old['size']:,}  →  {new['size']:,} bytes  ({'+' if d >= 0 else ''}{d:,})")
+            row(5, "New SHA", new["sha256"])
 
         def copy_new_note():
-            note = (f"{new['name']} v{new['apk'].get('version_name', '')} "
-                    f"(code {new['apk'].get('version_code', '')}) - "
+            na = new.get("apk") or {}
+            ver = (f" v{na.get('version_name', '')} (code {na.get('version_code', '')})"
+                   if na else "")
+            note = (f"{new['name']}{ver} - "
                     f"{new['size']:,} bytes - SHA-256 {new['sha256']}")
             if new.get("signer"):
                 note += f"\nSigner SHA-256 {new['signer']}"
