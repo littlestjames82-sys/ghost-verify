@@ -3,7 +3,11 @@
 # Pure Python standard library (tkinter + hashlib). No installs, no
 # accounts, and no network except the one fetch the user asks for.
 #
-# Run:  python3 ghost_verify.py [file]
+# Run:  python3 ghost_verify.py [file]            (GUI)
+#       python3 ghost_verify.py --info FILE       (JSON profile)
+#       python3 ghost_verify.py --check FILE HASH (exit 0 = match)
+#       python3 ghost_verify.py --sums FOLDER     (SHA256SUMS text)
+#       python3 ghost_verify.py --batch SUMS FOLDER (exit 0 = all match)
 # Every APK and package the studio ships carries a SHA-256 in its ship
 # note. Drop the file in here, paste the expected hash, get a verdict.
 
@@ -333,7 +337,7 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
     user pastes a URL and asks. Plain GET, no cookies, no auth.
     Display-free.
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.6"})
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.7"})
     fd, path = tempfile.mkstemp(prefix="ghostverify-", suffix=".bin")
     done = 0
     with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out:
@@ -353,11 +357,14 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
     return path
 
 
-def generate_sums(folder, progress=None):
+def generate_sums(folder, progress=None, exclude=None):
     """Build sha256sum-format text for every file directly in folder
-    (top level only, sorted by name). Display-free."""
+    (top level only, sorted by name). `exclude` names one file to
+    skip — the sums file itself when it is being written into the
+    same folder, since a sums file can never contain its own hash.
+    Display-free."""
     names = sorted(f for f in os.listdir(folder)
-                   if os.path.isfile(os.path.join(folder, f)))
+                   if os.path.isfile(os.path.join(folder, f)) and f != exclude)
     lines = []
     for i, name in enumerate(names):
         sha, _s512, _md5, _size = hash_file(os.path.join(folder, name))
@@ -398,7 +405,7 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.6 - file hash checker")
+        self.title("Ghost Verify 1.7 - file hash checker")
         self.geometry("660x720")
         self.minsize(580, 620)
         self.configure(bg=BG)
@@ -481,7 +488,7 @@ class GhostVerify(tk.Tk):
         header.pack(fill="x", pady=(12, 0), **pad)
         tk.Label(header, text="GHOST VERIFY", bg=BG, fg=TEXT1,
                  font=("Helvetica", 17, "bold")).pack(side="left")
-        tk.Label(header, text=" 1.6 ", bg=ACCENT, fg="white",
+        tk.Label(header, text=" 1.7 ", bg=ACCENT, fg="white",
                  font=("Helvetica", 9, "bold")).pack(side="left", padx=(10, 0))
         tk.Label(header, text="Ghost Developer Studio", bg=BG, fg=TEXT2,
                  font=("Helvetica", 9)).pack(side="right")
@@ -779,10 +786,15 @@ class GhostVerify(tk.Tk):
             return
         self.status_var.set("Hashing files for SHA256SUMS...")
 
+        exclude = (os.path.basename(dest)
+                   if os.path.dirname(os.path.abspath(dest)) == os.path.abspath(folder)
+                   else None)
+
         def work():
             try:
                 text = generate_sums(
-                    folder, progress=lambda f: self.events.put(("sums_progress", f)))
+                    folder, progress=lambda f: self.events.put(("sums_progress", f)),
+                    exclude=exclude)
                 with open(dest, "w", encoding="utf-8") as fh:
                     fh.write(text)
                 self.events.put(("sums_done", (dest, text.count("\n"))))
@@ -1041,7 +1053,54 @@ class GhostVerify(tk.Tk):
                 self.log_event(f"verdict NO MATCH: expected {expected}, got {actual}")
 
 
+def cli(argv):
+    """Scriptable mode. Returns an exit code, or None to open the GUI.
+
+    --info FILE          JSON profile (hashes, size, APK fields, signer)
+    --check FILE HASH    prints MATCH / NO MATCH; exit 0 only on match
+    --sums FOLDER        SHA256SUMS text for the folder's top level
+    --batch SUMS FOLDER  per-file verdicts; exit 0 only if all match
+    Exit 2 is a usage or file error in every mode.
+    """
+    if not argv or argv[0] not in ("--info", "--check", "--sums", "--batch"):
+        return None
+    mode, args = argv[0], argv[1:]
+    try:
+        if mode == "--info" and len(args) == 1:
+            prof = file_profile(args[0])
+            print(json.dumps(prof, indent=2, default=str))
+            return 0
+        if mode == "--check" and len(args) == 2:
+            sha, _s512, _md5, _size = hash_file(args[0])
+            ok = sha == args[1].strip().lower()
+            print(("MATCH " if ok else "NO MATCH ") + sha)
+            return 0 if ok else 1
+        if mode == "--sums" and len(args) == 1:
+            sys.stdout.write(generate_sums(args[0]))
+            return 0
+        if mode == "--batch" and len(args) == 2:
+            with open(args[0], "r", encoding="utf-8", errors="replace") as fh:
+                entries = parse_sums(fh.read())
+            if not entries:
+                print("no SHA-256 entries in the sums file", file=sys.stderr)
+                return 2
+            marks = {"match": "MATCH  ", "differ": "DIFFER ", "missing": "MISSING"}
+            results = verify_batch(args[1], entries)
+            for name, status in results:
+                print(f"{marks[status]} {name}")
+            return 0 if all(s == "match" for _n, s in results) else 1
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(__doc__ or "usage: ghost_verify.py [--info FILE | --check FILE HASH | "
+                     "--sums FOLDER | --batch SUMS FOLDER | FILE]", file=sys.stderr)
+    return 2
+
+
 def main():
+    code = cli(sys.argv[1:])
+    if code is not None:
+        sys.exit(code)
     start = sys.argv[1] if len(sys.argv) > 1 else ""
     app = GhostVerify(start)
     app.mainloop()
