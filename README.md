@@ -92,6 +92,14 @@ it — a sums file can never contain its own hash.
     files, and native ABIs (a pure-Java WebView app shows "no
     native libs"; the GhostIDE universal APK shows arm64-v8a), with
     a View button listing every entry in the zip.
+13. **Release report:** one click audits a whole release folder —
+    the SHA256SUMS verdict (the sums file's own entry is ignored;
+    it can never verify against itself), a profile block for every
+    APK, and a signer-consistency check across all of them, ending
+    in a READY / problems verdict. The report copies out as text
+    for the release record. **Compare files** also works on
+    non-APKs now: identical-or-different by hash, with sizes and
+    both hashes shown.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
