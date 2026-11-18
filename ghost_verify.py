@@ -284,6 +284,24 @@ def signer_fingerprint(path):
         return None
 
 
+def apk_contents(path):
+    """What's inside the APK: entry count, dex files, native ABIs,
+    uncompressed total, and the entry names. Display-free."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            infos = zf.infolist()
+        names = [i.filename for i in infos]
+        abis = sorted({n.split("/")[1] for n in names
+                       if n.startswith("lib/") and n.count("/") >= 2})
+        return {"entries": len(names),
+                "dex": sorted(n for n in names if n.endswith(".dex")),
+                "abis": abis,
+                "uncompressed": sum(i.file_size for i in infos),
+                "files": names}
+    except Exception:
+        return None
+
+
 def file_profile(path):
     """Everything Ghost Verify knows about one file, in one dict."""
     sha, sha512, md5, size = hash_file(path)
@@ -337,7 +355,7 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
     user pastes a URL and asks. Plain GET, no cookies, no auth.
     Display-free.
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.7"})
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.8"})
     fd, path = tempfile.mkstemp(prefix="ghostverify-", suffix=".bin")
     done = 0
     with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out:
@@ -405,7 +423,7 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.7 - file hash checker")
+        self.title("Ghost Verify 1.8 - file hash checker")
         self.geometry("660x720")
         self.minsize(580, 620)
         self.configure(bg=BG)
@@ -488,7 +506,7 @@ class GhostVerify(tk.Tk):
         header.pack(fill="x", pady=(12, 0), **pad)
         tk.Label(header, text="GHOST VERIFY", bg=BG, fg=TEXT1,
                  font=("Helvetica", 17, "bold")).pack(side="left")
-        tk.Label(header, text=" 1.7 ", bg=ACCENT, fg="white",
+        tk.Label(header, text=" 1.8 ", bg=ACCENT, fg="white",
                  font=("Helvetica", 9, "bold")).pack(side="left", padx=(10, 0))
         tk.Label(header, text="Ghost Developer Studio", bg=BG, fg=TEXT2,
                  font=("Helvetica", 9)).pack(side="right")
@@ -560,6 +578,17 @@ class GhostVerify(tk.Tk):
         tk.Button(apkf, text="View", bg=BG, fg=TEXT2, relief="flat",
                   font=("Helvetica", 8), command=self.show_permissions) \
             .grid(row=5, column=2, padx=8)
+        self.apk_files = tk.StringVar(value="")
+        self.current_contents = None
+        tk.Label(apkf, text="Files", bg=SURFACE, fg=TEXT2,
+                 font=("Helvetica", 10, "bold"), width=9, anchor="w") \
+            .grid(row=6, column=0, padx=10, pady=5, sticky="w")
+        tk.Label(apkf, textvariable=self.apk_files, bg=SURFACE, fg=TEXT1,
+                 font=("Courier", 9), anchor="w") \
+            .grid(row=6, column=1, sticky="w")
+        tk.Button(apkf, text="View", bg=BG, fg=TEXT2, relief="flat",
+                  font=("Helvetica", 8), command=self.show_contents) \
+            .grid(row=6, column=2, padx=8)
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", pady=(10, 0), **pad)
@@ -602,6 +631,12 @@ class GhostVerify(tk.Tk):
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
+        self.watch = None
+        self.watch_btn = tk.Button(actions2, text="Watch folder",
+                                   command=self.toggle_watch,
+                                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                                   relief="flat", font=("Helvetica", 10), padx=10, pady=4)
+        self.watch_btn.pack(side="left", padx=(8, 0))
 
         exp_label = tk.Label(self, text="Expected SHA-256 (from the ship note):",
                              bg=BG, fg=TEXT2, font=("Helvetica", 10))
@@ -721,6 +756,9 @@ class GhostVerify(tk.Tk):
         self.md5_var.set(md5)
         self.size_var.set(f"{size:,} bytes ({human_size(size)})")
         self.status_var.set("Done.")
+        if getattr(self, "_watch_note", None):
+            self.status_var.set(f"Watch: {self._watch_note} arrived and was verified.")
+            self._watch_note = None
         self.log_event(f"verified {os.path.basename(self.file_var.get().strip())}"
                        f" - {size:,} bytes - sha256 {sha}")
         self.add_recent(self.file_var.get().strip())
@@ -736,10 +774,112 @@ class GhostVerify(tk.Tk):
             self.apk_signer.set(fp if fp else "no v2/v3 signing block found")
             perms = a.get("permissions", [])
             self.apk_perms.set(f"{len(perms)} permission" + ("" if len(perms) == 1 else "s"))
+            self.current_contents = apk_contents(self.file_var.get().strip())
+            if self.current_contents:
+                c = self.current_contents
+                abi_txt = ", ".join(c["abis"]) if c["abis"] else "no native libs"
+                self.apk_files.set(f"{c['entries']} entries · {len(c['dex'])} dex · {abi_txt}")
+            else:
+                self.apk_files.set("")
             self.apk_frame.pack(fill="x", pady=(10, 0), padx=14, after=self.results_frame)
         else:
+            self.current_contents = None
             self.apk_frame.pack_forget()
         self.check_verdict()
+
+    def show_contents(self):
+        if not self.current_contents:
+            return
+        c = self.current_contents
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - APK contents")
+        win.geometry("560x420")
+        win.configure(bg=BG)
+        tk.Label(win, text=f"{c['entries']} entries · {len(c['dex'])} dex file(s) · "
+                           f"ABIs: {', '.join(c['abis']) if c['abis'] else 'none'} · "
+                           f"{c['uncompressed']:,} bytes uncompressed",
+                 bg=BG, fg=TEXT1, font=("Helvetica", 10, "bold"), wraplength=520,
+                 justify="left").pack(anchor="w", padx=12, pady=(10, 6))
+        text = tk.Text(win, bg=SURFACE, fg=TEXT1, relief="flat",
+                       font=("Courier", 9), wrap="none")
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        text.insert("1.0", "\n".join(c["files"][:500])
+                    + ("\n… (list capped at 500)" if len(c["files"]) > 500 else ""))
+        text.configure(state="disabled")
+
+    # ------------------------------------------------------------ watch mode
+    def toggle_watch(self):
+        if self.watch:
+            self.watch = None
+            self.watch_btn.configure(text="Watch folder")
+            self.status_var.set("Stopped watching.")
+            return
+        folder = filedialog.askdirectory(
+            title="Choose the folder to watch (a build output folder)")
+        if folder:
+            self.watch_folder(folder)
+
+    def watch_folder(self, folder):
+        seen = {}
+        try:
+            for name in os.listdir(folder):
+                p = os.path.join(folder, name)
+                if os.path.isfile(p):
+                    st = os.stat(p)
+                    seen[name] = (st.st_size, st.st_mtime)
+        except OSError:
+            pass
+        self.watch = {"folder": folder, "seen": seen, "candidates": {}}
+        self.watch_btn.configure(text="Stop watching")
+        self.status_var.set(f"Watching {folder} — new or changed files verify themselves.")
+        self.log_event(f"watch started on {folder}")
+        self.after(1200, self._watch_tick)
+
+    def _watch_tick(self):
+        if not self.watch:
+            return
+        try:
+            folder = self.watch["folder"]
+            current = {}
+            for name in os.listdir(folder):
+                if name.startswith(".") or name.endswith((".tmp", ".part", ".crdownload")):
+                    continue
+                p = os.path.join(folder, name)
+                if os.path.isfile(p):
+                    st = os.stat(p)
+                    current[name] = (st.st_size, st.st_mtime)
+            # State machine: `seen` holds files that are done (the
+            # initial snapshot plus everything already fired on).
+            # Anything else is a candidate; it fires only when its
+            # size+mtime are identical on two further polls, so a
+            # file still being copied never gets hashed half-way.
+            fired = None
+            for name, sig in current.items():
+                if self.watch["seen"].get(name) == sig:
+                    continue
+                prev = self.watch["candidates"].get(name)
+                if prev and prev[0] == sig:
+                    if prev[1] >= 2:
+                        fired = name
+                    else:
+                        self.watch["candidates"][name] = (sig, prev[1] + 1)
+                else:
+                    self.watch["candidates"][name] = (sig, 1)
+            for name in list(self.watch["candidates"]):
+                if name not in current:
+                    del self.watch["candidates"][name]
+            if fired:
+                self.watch["seen"][fired] = current[fired]
+                path = os.path.join(folder, fired)
+                self.watch["candidates"].pop(fired, None)
+                self.log_event(f"watch: {fired} landed in {folder}")
+                self._watch_note = fired
+                self.file_var.set(path)
+                self.verify()
+        except Exception:
+            pass  # a vanished folder or file must never kill the watcher
+        if self.watch:
+            self.after(1200, self._watch_tick)
 
     def show_permissions(self):
         if not self.current_apk:
