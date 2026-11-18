@@ -11,10 +11,13 @@ import os
 import queue
 import struct
 import sys
+import tempfile
 import threading
+import time
 import tkinter as tk
+import urllib.request
 import zipfile
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 # GhostUx tokens (same palette as Ghost Browser)
 BG = "#121214"
@@ -262,6 +265,33 @@ def compare_profiles(old, new):
     return out
 
 
+def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
+    """Download url to a temp file and return its path.
+
+    The one network action in the tool, and it only happens when the
+    user pastes a URL and asks. Plain GET, no cookies, no auth.
+    Display-free.
+    """
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.5"})
+    fd, path = tempfile.mkstemp(prefix="ghostverify-", suffix=".bin")
+    done = 0
+    with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        while True:
+            block = resp.read(256 * 1024)
+            if not block:
+                break
+            done += len(block)
+            if done > cap:
+                out.close()
+                os.unlink(path)
+                raise ValueError("remote file is larger than the 200 MB cap")
+            out.write(block)
+            if progress is not None and total:
+                progress(done / total)
+    return path
+
+
 def generate_sums(folder, progress=None):
     """Build sha256sum-format text for every file directly in folder
     (top level only, sorted by name). Display-free."""
@@ -307,9 +337,9 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.4 - file hash checker")
-        self.geometry("660x620")
-        self.minsize(580, 540)
+        self.title("Ghost Verify 1.5 - file hash checker")
+        self.geometry("660x680")
+        self.minsize(580, 600)
         self.configure(bg=BG)
 
         self.file_var = tk.StringVar(value=start_file)
@@ -352,6 +382,10 @@ class GhostVerify(tk.Tk):
                     self.status_var.set(f"Wrote {count} entries to {dest}")
                 elif kind == "compare_done":
                     self.show_compare(payload[0], payload[1])
+                elif kind == "fetch_progress":
+                    self.status_var.set(f"Fetching... {int(payload * 100)}%")
+                elif kind == "fetch_done":
+                    self.show_fetch_result(payload[0], payload[1], payload[2])
                 elif kind == "error":
                     messagebox.showerror("Ghost Verify", payload)
                     self.status_var.set("Failed.")
@@ -445,6 +479,26 @@ class GhostVerify(tk.Tk):
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
 
+        self.session_log = []
+        self._logged_verdicts = set()
+        actions2 = tk.Frame(self, bg=BG)
+        actions2.pack(fill="x", pady=(8, 0), **pad)
+        tk.Button(actions2, text="Fetch & compare URL",
+                  command=self.start_fetch,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left")
+        tk.Button(actions2, text="Paste hash",
+                  command=self.paste_hash,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
+        tk.Button(actions2, text="Session log",
+                  command=self.show_session_log,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
+
         exp_label = tk.Label(self, text="Expected SHA-256 (from the ship note):",
                              bg=BG, fg=TEXT2, font=("Helvetica", 10))
         exp_label.pack(anchor="w", pady=(14, 4), **pad)
@@ -503,12 +557,18 @@ class GhostVerify(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def log_event(self, text):
+        stamp = time.strftime("%H:%M:%S")
+        self.session_log.append(f"[{stamp}] {text}")
+
     def show_result(self, sha, sha512, md5, size):
         self.sha_var.set(sha)
         self.sha512_var.set(sha512)
         self.md5_var.set(md5)
         self.size_var.set(f"{size:,} bytes ({human_size(size)})")
         self.status_var.set("Done.")
+        self.log_event(f"verified {os.path.basename(self.file_var.get().strip())}"
+                       f" - {size:,} bytes - sha256 {sha}")
         self.current_apk = apk_info(self.file_var.get().strip())
         if self.current_apk:
             a = self.current_apk
@@ -582,6 +642,84 @@ class GhostVerify(tk.Tk):
                 self.events.put(("error", str(exc)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ fetch & log
+    def paste_hash(self):
+        try:
+            text = self.clipboard_get().strip().lower()
+        except tk.TclError:
+            text = ""
+        if len(text) == 64 and all(c in "0123456789abcdef" for c in text):
+            self.expected_var.set(text)
+            self.status_var.set("Expected hash pasted from clipboard.")
+        else:
+            self.status_var.set("The clipboard does not hold a SHA-256 hash.")
+
+    def start_fetch(self):
+        url = simpledialog.askstring(
+            "Fetch & compare",
+            "Paste the URL of the published copy (for example the file\n"
+            "on the downloads site). It is downloaded to a temp file,\n"
+            "hashed, and compared with the file currently loaded.",
+            parent=self)
+        if not url:
+            return
+        prev_sha = self.sha_var.get()
+        self.status_var.set("Fetching...")
+
+        def work():
+            try:
+                path = fetch_to_temp(
+                    url.strip(),
+                    progress=lambda f: self.events.put(("fetch_progress", f)))
+                self.events.put(("fetch_done", (file_profile(path), prev_sha, url.strip())))
+            except Exception as exc:
+                self.events.put(("error", f"Fetch failed: {exc}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_fetch_result(self, prof, prev_sha, url):
+        fetched_sha = prof["sha256"]
+        self.file_var.set(prof["path"])
+        self.show_result(prof["sha256"], prof["sha512"], prof["md5"], prof["size"])
+        if prev_sha and prev_sha != "-":
+            if prev_sha == fetched_sha:
+                self.verdict_var.set("✓  The published copy MATCHES the local file")
+                self.verdict.configure(fg=GOOD)
+                self.log_event(f"fetched {url} - MATCHES the local file")
+            else:
+                self.verdict_var.set("✗  The published copy DIFFERS from the local file")
+                self.verdict.configure(fg=BAD)
+                self.log_event(f"fetched {url} - DIFFERS from the local file "
+                               f"(remote sha256 {fetched_sha})")
+        else:
+            self.status_var.set("Fetched copy loaded. Verify a local file first to compare next time.")
+            self.log_event(f"fetched {url} - sha256 {fetched_sha}")
+
+    def show_session_log(self):
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - session log")
+        win.geometry("680x400")
+        win.configure(bg=BG)
+        tk.Label(win, text="Everything verified in this session. Copy it into the release record.",
+                 bg=BG, fg=TEXT2, font=("Helvetica", 9)) \
+            .pack(anchor="w", padx=12, pady=(10, 6))
+        text = tk.Text(win, bg=SURFACE, fg=TEXT1, relief="flat",
+                       font=("Courier", 9), wrap="word")
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        text.insert("1.0", "\n".join(self.session_log) if self.session_log
+                    else "(nothing verified yet this session)")
+        text.configure(state="disabled")
+
+        def copy_log():
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(self.session_log))
+            self.status_var.set("Session log copied.")
+
+        tk.Button(win, text="Copy log", command=copy_log, bg=ACCENT, fg="white",
+                  activebackground=ACCENT_SOFT, relief="flat",
+                  font=("Helvetica", 10, "bold"), padx=12, pady=4) \
+            .pack(anchor="w", padx=12, pady=(0, 12))
 
     # ------------------------------------------------------------ compare mode
     def start_compare(self):
@@ -743,12 +881,20 @@ class GhostVerify(tk.Tk):
         if expected == actual:
             self.verdict_var.set("✓  MATCH — this is the file from the ship note")
             self.verdict.configure(fg=GOOD)
+            key = (actual, expected, "match")
+            if key not in self._logged_verdicts:
+                self._logged_verdicts.add(key)
+                self.log_event(f"verdict MATCH for sha256 {actual}")
         elif actual.startswith(expected) or expected.startswith(actual[:16]):
             self.verdict_var.set("…  partial hash — keep pasting")
             self.verdict.configure(fg=TEXT2)
         else:
             self.verdict_var.set("✗  NO MATCH — not the file from the ship note")
             self.verdict.configure(fg=BAD)
+            key = (actual, expected, "nomatch")
+            if key not in self._logged_verdicts:
+                self._logged_verdicts.add(key)
+                self.log_event(f"verdict NO MATCH: expected {expected}, got {actual}")
 
 
 def main():
