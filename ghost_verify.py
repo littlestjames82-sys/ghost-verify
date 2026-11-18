@@ -1,12 +1,14 @@
 # This code is written in the export style of PyUIBuilder: https://pyuibuilder.com
 # Ghost Verify - a file hash checker for the Ghost Developer Studio ship workflow.
-# Pure Python standard library (tkinter + hashlib). No installs, no network.
+# Pure Python standard library (tkinter + hashlib). No installs, no
+# accounts, and no network except the one fetch the user asks for.
 #
 # Run:  python3 ghost_verify.py [file]
 # Every APK and package the studio ships carries a SHA-256 in its ship
 # note. Drop the file in here, paste the expected hash, get a verdict.
 
 import hashlib
+import json
 import os
 import queue
 import struct
@@ -17,6 +19,7 @@ import time
 import tkinter as tk
 import urllib.request
 import zipfile
+import zlib
 from tkinter import filedialog, messagebox, simpledialog
 
 # GhostUx tokens (same palette as Ghost Browser)
@@ -27,9 +30,67 @@ ACCENT_SOFT = "#9D6BFF"
 TEXT1 = "#F2F2F5"
 TEXT2 = "#A7A7B3"
 GOOD = "#3FB96B"
+GOOD_BG = "#12291A"
 BAD = "#E5534B"
+BAD_BG = "#331B19"
 
 CHUNK = 1024 * 1024
+
+RECENT_PATH = os.path.join(os.path.expanduser("~"), ".ghost-verify.json")
+
+
+def load_recent():
+    """Recent verified files, most recent first. Display-free."""
+    try:
+        with open(RECENT_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return [p for p in data.get("recent", []) if isinstance(p, str)][:5]
+    except Exception:
+        return []
+
+
+def save_recent(paths):
+    try:
+        with open(RECENT_PATH, "w", encoding="utf-8") as fh:
+            json.dump({"recent": paths[:5]}, fh)
+    except Exception:
+        pass
+
+
+def icon_png_bytes(size=48):
+    """A tiny studio ghost, drawn pixel by pixel: a white ghost with
+    two violet eyes on the GhostUx background. Original mark, drawn
+    for this app. Returns PNG bytes. Display-free."""
+    bgc = (0x12, 0x12, 0x14)
+    body = (0xF2, 0xF2, 0xF5)
+    eye = (0x67, 0x16, 0xF3)
+    rows = []
+    cx = size / 2.0
+    for y in range(size):
+        row = bytearray()
+        row.append(0)  # PNG filter: none
+        for x in range(size):
+            px = bgc
+            in_x = size * 0.28 < x < size * 0.72
+            head = in_x and y > size * 0.22 and ((x - cx) ** 2 + (y - size * 0.42) ** 2) < (size * 0.21) ** 2
+            torso = in_x and size * 0.38 < y < size * 0.74
+            foot_wave = in_x and size * 0.74 <= y < size * 0.82 and ((x // max(size // 8, 1)) % 2 == 0)
+            if head or torso or foot_wave:
+                px = body
+                for ex in (cx - size * 0.09, cx + size * 0.09):
+                    if (x - ex) ** 2 + (y - size * 0.42) ** 2 < (size * 0.045) ** 2:
+                        px = eye
+            row += bytes(px)
+        rows.append(bytes(row))
+    raw = b"".join(rows)
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
 
 
 def hash_file(path, progress=None):
@@ -272,7 +333,7 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
     user pastes a URL and asks. Plain GET, no cookies, no auth.
     Display-free.
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.5"})
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.6"})
     fd, path = tempfile.mkstemp(prefix="ghostverify-", suffix=".bin")
     done = 0
     with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out:
@@ -337,10 +398,16 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.5 - file hash checker")
-        self.geometry("660x680")
-        self.minsize(580, 600)
+        self.title("Ghost Verify 1.6 - file hash checker")
+        self.geometry("660x720")
+        self.minsize(580, 620)
         self.configure(bg=BG)
+        try:
+            self._icon = tk.PhotoImage(data=icon_png_bytes())
+            self.iconphoto(True, self._icon)
+        except Exception:
+            pass
+        self.recent = load_recent()
 
         self.file_var = tk.StringVar(value=start_file)
         self.expected_var = tk.StringVar()
@@ -357,6 +424,11 @@ class GhostVerify(tk.Tk):
         # them. Poll on a timer.
         self.events = queue.Queue()
         self.build_widgets()
+        self.bind_all("<Control-o>", lambda _e: self.browse())
+        self.bind_all("<Control-O>", lambda _e: self.browse())
+        self.bind_all("<F5>", lambda _e: self.verify())
+        self.bind_all("<Control-l>", lambda _e: self.show_session_log())
+        self.bind_all("<Control-L>", lambda _e: self.show_session_log())
         self.after(60, self.poll_events)
         if start_file:
             self.after(150, self.verify)
@@ -367,8 +439,10 @@ class GhostVerify(tk.Tk):
                 kind, payload = self.events.get_nowait()
                 if kind == "progress":
                     self.status_var.set(f"Hashing... {int(payload * 100)}%")
+                    self.set_progress(payload)
                 elif kind == "done":
                     sha, sha512, md5, size = payload
+                    self.set_progress(None)
                     self.show_result(sha, sha512, md5, size)
                 elif kind == "batch_progress":
                     if getattr(self, "batch_status", None) is not None:
@@ -377,16 +451,21 @@ class GhostVerify(tk.Tk):
                     self.show_batch_results(payload)
                 elif kind == "sums_progress":
                     self.status_var.set(f"Hashing files for SHA256SUMS... {int(payload * 100)}%")
+                    self.set_progress(payload)
                 elif kind == "sums_done":
                     dest, count = payload
+                    self.set_progress(None)
                     self.status_var.set(f"Wrote {count} entries to {dest}")
                 elif kind == "compare_done":
                     self.show_compare(payload[0], payload[1])
                 elif kind == "fetch_progress":
                     self.status_var.set(f"Fetching... {int(payload * 100)}%")
+                    self.set_progress(payload)
                 elif kind == "fetch_done":
+                    self.set_progress(None)
                     self.show_fetch_result(payload[0], payload[1], payload[2])
                 elif kind == "error":
+                    self.set_progress(None)
                     messagebox.showerror("Ghost Verify", payload)
                     self.status_var.set("Failed.")
         except queue.Empty:
@@ -397,12 +476,19 @@ class GhostVerify(tk.Tk):
     def build_widgets(self):
         pad = {"padx": 14}
 
-        title = tk.Label(self, text="GHOST VERIFY", bg=BG, fg=TEXT1,
-                         font=("Helvetica", 17, "bold"))
-        title.pack(anchor="w", pady=(14, 0), **pad)
-        sub = tk.Label(self, text="Hash a file. Paste the expected hash. Get a verdict.",
-                       bg=BG, fg=TEXT2, font=("Helvetica", 10))
-        sub.pack(anchor="w", pady=(0, 10), **pad)
+        tk.Frame(self, bg=ACCENT, height=4).pack(fill="x")
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", pady=(12, 0), **pad)
+        tk.Label(header, text="GHOST VERIFY", bg=BG, fg=TEXT1,
+                 font=("Helvetica", 17, "bold")).pack(side="left")
+        tk.Label(header, text=" 1.6 ", bg=ACCENT, fg="white",
+                 font=("Helvetica", 9, "bold")).pack(side="left", padx=(10, 0))
+        tk.Label(header, text="Ghost Developer Studio", bg=BG, fg=TEXT2,
+                 font=("Helvetica", 9)).pack(side="right")
+        sub = tk.Label(self, text="Hash a file. Paste the expected hash. Get a verdict.  "
+                                  "Shortcuts: Ctrl+O open · F5 re-verify · Ctrl+L log",
+                       bg=BG, fg=TEXT2, font=("Helvetica", 9))
+        sub.pack(anchor="w", pady=(2, 10), **pad)
 
         file_frame = tk.Frame(self, bg=BG)
         file_frame.pack(fill="x", **pad)
@@ -410,10 +496,15 @@ class GhostVerify(tk.Tk):
                          fg=TEXT1, insertbackground=TEXT1, relief="flat",
                          font=("Courier", 10))
         entry.pack(side="left", fill="x", expand=True, ipady=6)
+        entry.bind("<Return>", lambda _e: self.verify())
         browse = tk.Button(file_frame, text="Browse", command=self.browse,
                            bg=ACCENT, fg="white", activebackground=ACCENT_SOFT,
                            relief="flat", font=("Helvetica", 10, "bold"), padx=12)
         browse.pack(side="left", padx=(8, 0))
+
+        self.recent_frame = tk.Frame(self, bg=BG)
+        self.recent_frame.pack(fill="x", pady=(6, 0), **pad)
+        self.refresh_recent()
 
         verify_btn = tk.Button(self, text="VERIFY FILE", command=self.verify,
                                bg=ACCENT, fg="white", activebackground=ACCENT_SOFT,
@@ -423,6 +514,12 @@ class GhostVerify(tk.Tk):
         self.status = tk.Label(self, textvariable=self.status_var, bg=BG,
                                fg=TEXT2, font=("Helvetica", 9))
         self.status.pack(anchor="w", **pad)
+
+        self.progress_outer = tk.Frame(self, bg=SURFACE, height=4)
+        self.progress_outer.pack(fill="x", pady=(4, 0), **pad)
+        self.progress_outer.pack_propagate(False)
+        self.progress_inner = tk.Frame(self.progress_outer, bg=ACCENT)
+        self.progress_inner.place(x=0, y=0, relheight=1.0, relwidth=0.0)
 
         results = tk.Frame(self, bg=SURFACE)
         results.pack(fill="x", pady=(10, 0), **pad)
@@ -507,9 +604,12 @@ class GhostVerify(tk.Tk):
                             font=("Courier", 10))
         expected.pack(fill="x", ipady=6, **pad)
 
-        self.verdict = tk.Label(self, textvariable=self.verdict_var, bg=BG,
-                                font=("Helvetica", 14, "bold"))
-        self.verdict.pack(anchor="w", pady=(10, 0), **pad)
+        self.banner = tk.Frame(self, bg=SURFACE)
+        self.banner.pack(fill="x", pady=(12, 0), **pad)
+        self.verdict = tk.Label(self.banner, textvariable=self.verdict_var,
+                                bg=SURFACE, fg=TEXT2,
+                                font=("Helvetica", 13, "bold"), anchor="w")
+        self.verdict.pack(fill="x", padx=12, pady=9)
 
     def result_row(self, parent, label, var, row):
         tk.Label(parent, text=label, bg=SURFACE, fg=TEXT2,
@@ -522,6 +622,53 @@ class GhostVerify(tk.Tk):
                   font=("Helvetica", 8),
                   command=lambda v=var: self.copy(v.get())) \
             .grid(row=row, column=2, padx=8)
+
+    # ------------------------------------------------------------ UI helpers
+    def set_progress(self, frac):
+        if frac is None:
+            self.progress_inner.place_configure(relwidth=0.0)
+        else:
+            self.progress_inner.place_configure(relwidth=max(0.0, min(frac, 1.0)))
+
+    def set_banner(self, text, kind="neutral"):
+        """kind: 'good' | 'bad' | 'neutral'. The verdict banner is the
+        window's anchor: green tint for a match, red for a mismatch."""
+        self.verdict_var.set(text)
+        bg = {"good": GOOD_BG, "bad": BAD_BG}.get(kind, SURFACE)
+        fg = {"good": GOOD, "bad": "#FF8A80"}.get(kind, TEXT2)
+        self.banner.configure(bg=bg)
+        self.verdict.configure(bg=bg, fg=fg)
+
+    def refresh_recent(self):
+        for child in self.recent_frame.winfo_children():
+            child.destroy()
+        existing = [p for p in self.recent if os.path.isfile(p)]
+        if not existing:
+            return
+        tk.Label(self.recent_frame, text="Recent:", bg=BG, fg=TEXT2,
+                 font=("Helvetica", 9)).pack(side="left")
+        for path in existing:
+            tk.Button(self.recent_frame, text=os.path.basename(path),
+                      command=lambda p=path: self.open_recent(p),
+                      bg=BG, fg=ACCENT_SOFT, activebackground=SURFACE,
+                      relief="flat", font=("Helvetica", 9), padx=4) \
+                .pack(side="left")
+
+    def open_recent(self, path):
+        self.file_var.set(path)
+        self.verify()
+
+    def add_recent(self, path):
+        if not path or not os.path.isfile(path):
+            return
+        if os.path.basename(path).startswith("ghostverify-"):
+            return  # fetched temp copies are not recents
+        if path in self.recent:
+            self.recent.remove(path)
+        self.recent.insert(0, path)
+        self.recent = self.recent[:5]
+        save_recent(self.recent)
+        self.refresh_recent()
 
     # ------------------------------------------------------------ actions
     def browse(self):
@@ -545,7 +692,7 @@ class GhostVerify(tk.Tk):
             messagebox.showerror("Ghost Verify", f"Not a file: {path}")
             return
         self.status_var.set("Hashing...")
-        self.verdict_var.set("")
+        self.set_banner("")
 
         def work():
             try:
@@ -569,6 +716,7 @@ class GhostVerify(tk.Tk):
         self.status_var.set("Done.")
         self.log_event(f"verified {os.path.basename(self.file_var.get().strip())}"
                        f" - {size:,} bytes - sha256 {sha}")
+        self.add_recent(self.file_var.get().strip())
         self.current_apk = apk_info(self.file_var.get().strip())
         if self.current_apk:
             a = self.current_apk
@@ -684,12 +832,10 @@ class GhostVerify(tk.Tk):
         self.show_result(prof["sha256"], prof["sha512"], prof["md5"], prof["size"])
         if prev_sha and prev_sha != "-":
             if prev_sha == fetched_sha:
-                self.verdict_var.set("✓  The published copy MATCHES the local file")
-                self.verdict.configure(fg=GOOD)
+                self.set_banner("✓  The published copy MATCHES the local file", "good")
                 self.log_event(f"fetched {url} - MATCHES the local file")
             else:
-                self.verdict_var.set("✗  The published copy DIFFERS from the local file")
-                self.verdict.configure(fg=BAD)
+                self.set_banner("✗  The published copy DIFFERS from the local file", "bad")
                 self.log_event(f"fetched {url} - DIFFERS from the local file "
                                f"(remote sha256 {fetched_sha})")
         else:
@@ -876,21 +1022,19 @@ class GhostVerify(tk.Tk):
         expected = self.expected_var.get().strip().lower()
         actual = self.sha_var.get().strip().lower()
         if not expected or actual in ("", "-"):
-            self.verdict_var.set("")
+            if self.verdict_var.get():
+                self.set_banner("")
             return
         if expected == actual:
-            self.verdict_var.set("✓  MATCH — this is the file from the ship note")
-            self.verdict.configure(fg=GOOD)
+            self.set_banner("✓  MATCH — this is the file from the ship note", "good")
             key = (actual, expected, "match")
             if key not in self._logged_verdicts:
                 self._logged_verdicts.add(key)
                 self.log_event(f"verdict MATCH for sha256 {actual}")
         elif actual.startswith(expected) or expected.startswith(actual[:16]):
-            self.verdict_var.set("…  partial hash — keep pasting")
-            self.verdict.configure(fg=TEXT2)
+            self.set_banner("…  partial hash — keep pasting")
         else:
-            self.verdict_var.set("✗  NO MATCH — not the file from the ship note")
-            self.verdict.configure(fg=BAD)
+            self.set_banner("✗  NO MATCH — not the file from the ship note", "bad")
             key = (actual, expected, "nomatch")
             if key not in self._logged_verdicts:
                 self._logged_verdicts.add(key)
