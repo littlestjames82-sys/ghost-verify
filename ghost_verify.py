@@ -28,12 +28,14 @@ CHUNK = 1024 * 1024
 
 
 def hash_file(path, progress=None):
-    """Return (sha256_hex, md5_hex, size_bytes) for a file.
+    """Return (sha256_hex, sha512_hex, md5_hex, size_bytes) for a file.
 
-    progress, if given, is called with a 0..1 fraction as the file is
-    read. Kept display-free on purpose so it can be tested headlessly.
+    All three hashes come from a single read pass. progress, if given,
+    is called with a 0..1 fraction as the file is read. Kept
+    display-free on purpose so it can be tested headlessly.
     """
     sha = hashlib.sha256()
+    sha512 = hashlib.sha512()
     md5 = hashlib.md5()
     size = os.path.getsize(path)
     done = 0
@@ -43,11 +45,51 @@ def hash_file(path, progress=None):
             if not block:
                 break
             sha.update(block)
+            sha512.update(block)
             md5.update(block)
             done += len(block)
             if progress is not None and size:
                 progress(done / size)
-    return sha.hexdigest(), md5.hexdigest(), size
+    return sha.hexdigest(), sha512.hexdigest(), md5.hexdigest(), size
+
+
+def parse_sums(text):
+    """Parse sha256sum-format lines into (filename, hex) pairs.
+
+    Handles the standard forms: '<hash>  <name>' and '<hash> *<name>'
+    (the * marks binary mode). Blank lines and # comments are skipped.
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(None, 1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            continue
+        name = parts[1].lstrip("*").strip()
+        out.append((name, parts[0].lower()))
+    return out
+
+
+def verify_batch(folder, entries, progress=None):
+    """Check every (filename, expected_sha256) against folder.
+
+    Returns a list of (filename, status) where status is 'match',
+    'differ', or 'missing'. Display-free; tested headlessly.
+    """
+    results = []
+    total = max(len(entries), 1)
+    for i, (name, expected) in enumerate(entries):
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path):
+            results.append((name, "missing"))
+        else:
+            sha, _s512, _md5, _size = hash_file(path)
+            results.append((name, "match" if sha == expected else "differ"))
+        if progress is not None:
+            progress((i + 1) / total)
+    return results
 
 
 def human_size(n):
@@ -61,14 +103,15 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify - file hash checker")
-        self.geometry("640x430")
-        self.minsize(560, 400)
+        self.title("Ghost Verify 1.1 - file hash checker")
+        self.geometry("660x520")
+        self.minsize(580, 480)
         self.configure(bg=BG)
 
         self.file_var = tk.StringVar(value=start_file)
         self.expected_var = tk.StringVar()
         self.sha_var = tk.StringVar(value="-")
+        self.sha512_var = tk.StringVar(value="-")
         self.md5_var = tk.StringVar(value="-")
         self.size_var = tk.StringVar(value="-")
         self.status_var = tk.StringVar(value="Pick a file to begin.")
@@ -91,8 +134,13 @@ class GhostVerify(tk.Tk):
                 if kind == "progress":
                     self.status_var.set(f"Hashing... {int(payload * 100)}%")
                 elif kind == "done":
-                    sha, md5, size = payload
-                    self.show_result(sha, md5, size)
+                    sha, sha512, md5, size = payload
+                    self.show_result(sha, sha512, md5, size)
+                elif kind == "batch_progress":
+                    if getattr(self, "batch_status", None) is not None:
+                        self.batch_status.set(f"Checking... {int(payload * 100)}%")
+                elif kind == "batch_done":
+                    self.show_batch_results(payload)
                 elif kind == "error":
                     messagebox.showerror("Ghost Verify", payload)
                     self.status_var.set("Failed.")
@@ -134,8 +182,21 @@ class GhostVerify(tk.Tk):
         results = tk.Frame(self, bg=SURFACE)
         results.pack(fill="x", pady=(10, 0), **pad)
         self.result_row(results, "SHA-256", self.sha_var, 0)
-        self.result_row(results, "MD5", self.md5_var, 1)
-        self.result_row(results, "Size", self.size_var, 2)
+        self.result_row(results, "SHA-512", self.sha512_var, 1)
+        self.result_row(results, "MD5", self.md5_var, 2)
+        self.result_row(results, "Size", self.size_var, 3)
+
+        actions = tk.Frame(self, bg=BG)
+        actions.pack(fill="x", pady=(10, 0), **pad)
+        tk.Button(actions, text="Copy ship note", command=self.copy_ship_note,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left")
+        tk.Button(actions, text="Batch: verify folder vs SHA256SUMS",
+                  command=self.start_batch,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
 
         exp_label = tk.Label(self, text="Expected SHA-256 (from the ship note):",
                              bg=BG, fg=TEXT2, font=("Helvetica", 10))
@@ -154,7 +215,7 @@ class GhostVerify(tk.Tk):
                  font=("Helvetica", 10, "bold"), width=9, anchor="w") \
             .grid(row=row, column=0, padx=10, pady=5, sticky="w")
         tk.Label(parent, textvariable=var, bg=SURFACE, fg=TEXT1,
-                 font=("Courier", 9), anchor="w") \
+                 font=("Courier", 9), anchor="w", wraplength=480, justify="left") \
             .grid(row=row, column=1, sticky="w")
         tk.Button(parent, text="Copy", bg=BG, fg=TEXT2, relief="flat",
                   font=("Helvetica", 8),
@@ -195,12 +256,87 @@ class GhostVerify(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def show_result(self, sha, md5, size):
+    def show_result(self, sha, sha512, md5, size):
         self.sha_var.set(sha)
+        self.sha512_var.set(sha512)
         self.md5_var.set(md5)
         self.size_var.set(f"{size:,} bytes ({human_size(size)})")
         self.status_var.set("Done.")
         self.check_verdict()
+
+    def copy_ship_note(self):
+        sha = self.sha_var.get()
+        if sha in ("", "-"):
+            self.status_var.set("Verify a file first, then copy its ship note.")
+            return
+        name = os.path.basename(self.file_var.get().strip())
+        note = f"{name} - {self.size_var.get()} - SHA-256 {sha}"
+        self.clipboard_clear()
+        self.clipboard_append(note)
+        self.status_var.set("Ship note copied: " + note)
+
+    # ------------------------------------------------------------ batch mode
+    def start_batch(self):
+        sums = filedialog.askopenfilename(
+            title="Choose the SHA256SUMS file",
+            filetypes=[("Sums files", "SHA256SUMS* *.sha256 *.txt"), ("All files", "*.*")])
+        if not sums:
+            return
+        folder = filedialog.askdirectory(title="Choose the folder to verify")
+        if not folder:
+            return
+        try:
+            with open(sums, "r", encoding="utf-8", errors="replace") as fh:
+                entries = parse_sums(fh.read())
+        except Exception as exc:
+            messagebox.showerror("Ghost Verify", f"Could not read the sums file: {exc}")
+            return
+        if not entries:
+            messagebox.showwarning("Ghost Verify",
+                                   "No SHA-256 entries found in that file.")
+            return
+        self.open_batch_window(sums, folder, len(entries))
+
+        def work():
+            try:
+                results = verify_batch(
+                    folder, entries,
+                    progress=lambda f: self.events.put(("batch_progress", f)))
+                self.events.put(("batch_done", results))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_batch_window(self, sums, folder, count):
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - batch results")
+        win.geometry("620x420")
+        win.configure(bg=BG)
+        tk.Label(win, text=f"{count} files from {os.path.basename(sums)}  vs  {folder}",
+                 bg=BG, fg=TEXT2, font=("Helvetica", 9)) \
+            .pack(anchor="w", padx=12, pady=(10, 4))
+        self.batch_status = tk.StringVar(value="Checking...")
+        tk.Label(win, textvariable=self.batch_status, bg=BG, fg=TEXT1,
+                 font=("Helvetica", 11, "bold")) \
+            .pack(anchor="w", padx=12, pady=(0, 6))
+        self.batch_text = tk.Text(win, bg=SURFACE, fg=TEXT1, relief="flat",
+                                  font=("Courier", 10), wrap="none")
+        self.batch_text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+    def show_batch_results(self, results):
+        marks = {"match": "✓ MATCH  ", "differ": "✗ DIFFER ", "missing": "? MISSING"}
+        lines = []
+        counts = {"match": 0, "differ": 0, "missing": 0}
+        for name, status in results:
+            counts[status] += 1
+            lines.append(f"{marks[status]} {name}")
+        if getattr(self, "batch_text", None) is not None:
+            self.batch_text.delete("1.0", "end")
+            self.batch_text.insert("1.0", "\n".join(lines))
+            self.batch_status.set(
+                f"{counts['match']} match · {counts['differ']} differ · "
+                f"{counts['missing']} missing  (of {len(results)})")
 
     def check_verdict(self):
         expected = self.expected_var.get().strip().lower()
