@@ -100,6 +100,23 @@ it — a sums file can never contain its own hash.
     for the release record. **Compare files** also works on
     non-APKs now: identical-or-different by hash, with sizes and
     both hashes shown.
+14. **The history ledger (2.0):** every verification is remembered
+    in a SQLite ledger at `~/.ghost-verify.db`, each entry chained
+    to the previous entry's hash, so the history itself is
+    tamper-evident (the Ledger window and `--ledger` both verify
+    the chain and name the first broken entry). Because it
+    remembers, it can warn: verify an APK whose package was
+    previously seen under a different signer and the warning fires
+    on the spot — the wrong-keystore build, caught from history.
+    Re-verifying an already-recorded file is a no-op. `--info` and
+    `--check` record into the ledger too, so scripted builds feed
+    the same memory.
+15. **Site audit (2.0):** a release folder held up against the live
+    site — every local file fetched back from its published URL
+    and hash-compared, MATCH / DIFFER / NOT FOUND per file, with
+    an honest note that a static host cannot list published files
+    the folder does not hold. `--audit FOLDER URL` exits 0 only
+    when the site serves exactly the folder.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
