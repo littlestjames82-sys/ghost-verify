@@ -39,6 +39,13 @@ python3 ghost_verify.py file.apk   # start with a file loaded
    package, versionName, versionCode, and min/target SDK — the
    "is this really the build the note describes?" check. The ship
    note for an APK includes its version and code automatically.
+7. **APK trust pack:** the signer certificate's SHA-256, read from
+   the APK Signing Block (v2, or v3 when v2 is absent) — the
+   fingerprint that decides whether a build can install over the
+   previous one — and the full permissions list with a count, read
+   from the same manifest. Both were verified field-by-field against
+   `apksigner` and `aapt` output on real studio APKs. The ship note
+   for an APK gains a second line with the signer fingerprint.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
