@@ -157,10 +157,61 @@ def apk_info(path):
                 elif elem == "uses-sdk":
                     info["min_sdk"] = attrs.get("minSdkVersion", "")
                     info["target_sdk"] = attrs.get("targetSdkVersion", "")
-                if "package" in info and "min_sdk" in info:
+                elif elem == "uses-permission":
+                    info.setdefault("permissions", []).append(str(attrs.get("name", "")))
+                if "package" in info and "min_sdk" in info and elem == "application":
                     break
             off += csize
         return info if "package" in info else None
+    except Exception:
+        return None
+
+
+def _lp(data, off):
+    """Read one uint32-length-prefixed field; return (bytes, next_off)."""
+    n = struct.unpack_from("<I", data, off)[0]
+    return data[off + 4:off + 4 + n], off + 4 + n
+
+
+def signer_fingerprint(path):
+    """SHA-256 of the APK's signer certificate, from the APK Signing
+    Block (v2, or v3 if v2 is absent). None when there is no signing
+    block to read. Display-free; checked against apksigner in tests.
+    """
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        # End of central directory: scan the tail for the EOCD record.
+        tail = blob[-65558:]
+        eocd = tail.rfind(b"PK\x05\x06")
+        if eocd < 0:
+            return None
+        cd_off = struct.unpack_from("<I", tail, eocd + 16)[0]
+        # Signing block footer sits right before the central directory.
+        if blob[cd_off - 16:cd_off] != b"APK Sig Block 42":
+            return None
+        block_size = struct.unpack_from("<Q", blob, cd_off - 24)[0]
+        start = cd_off - block_size - 8
+        if struct.unpack_from("<Q", blob, start)[0] != block_size:
+            return None
+        end = cd_off - 24
+        blocks = {}
+        off = start + 8
+        while off + 12 <= end:
+            plen = struct.unpack_from("<Q", blob, off)[0]
+            pid = struct.unpack_from("<I", blob, off + 8)[0]
+            blocks[pid] = blob[off + 12:off + 8 + plen]
+            off += 8 + plen
+        value = blocks.get(0x7109871a) or blocks.get(0xF05368C0)  # v2, else v3
+        if value is None:
+            return None
+        signers, _ = _lp(value, 0)
+        signer, _ = _lp(signers, 0)
+        signed_data, rest = _lp(signer, 0)
+        _digests, rest2 = _lp(signed_data, 0)
+        certs, _ = _lp(signed_data, rest2)
+        cert, _ = _lp(certs, 0)
+        return hashlib.sha256(cert).hexdigest()
     except Exception:
         return None
 
@@ -210,9 +261,9 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.2 - file hash checker")
-        self.geometry("660x560")
-        self.minsize(580, 500)
+        self.title("Ghost Verify 1.3 - file hash checker")
+        self.geometry("660x620")
+        self.minsize(580, 540)
         self.configure(bg=BG)
 
         self.file_var = tk.StringVar(value=start_file)
@@ -304,6 +355,8 @@ class GhostVerify(tk.Tk):
         self.apk_ver = tk.StringVar(value="")
         self.apk_code = tk.StringVar(value="")
         self.apk_sdk = tk.StringVar(value="")
+        self.apk_signer = tk.StringVar(value="")
+        self.apk_perms = tk.StringVar(value="")
         self.current_apk = None
         apkf = tk.Frame(self, bg=SURFACE)
         self.apk_frame = apkf
@@ -311,6 +364,16 @@ class GhostVerify(tk.Tk):
         self.result_row(apkf, "Version", self.apk_ver, 1)
         self.result_row(apkf, "Code", self.apk_code, 2)
         self.result_row(apkf, "SDK", self.apk_sdk, 3)
+        self.result_row(apkf, "Signer", self.apk_signer, 4)
+        tk.Label(apkf, text="Perms", bg=SURFACE, fg=TEXT2,
+                 font=("Helvetica", 10, "bold"), width=9, anchor="w") \
+            .grid(row=5, column=0, padx=10, pady=5, sticky="w")
+        tk.Label(apkf, textvariable=self.apk_perms, bg=SURFACE, fg=TEXT1,
+                 font=("Courier", 9), anchor="w") \
+            .grid(row=5, column=1, sticky="w")
+        tk.Button(apkf, text="View", bg=BG, fg=TEXT2, relief="flat",
+                  font=("Helvetica", 8), command=self.show_permissions) \
+            .grid(row=5, column=2, padx=8)
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", pady=(10, 0), **pad)
@@ -400,10 +463,33 @@ class GhostVerify(tk.Tk):
             self.apk_ver.set(a.get("version_name", ""))
             self.apk_code.set(str(a.get("version_code", "")))
             self.apk_sdk.set(f"min {a.get('min_sdk', '?')} · target {a.get('target_sdk', '?')}")
+            fp = signer_fingerprint(self.file_var.get().strip())
+            a["signer"] = fp or ""
+            self.apk_signer.set(fp if fp else "no v2/v3 signing block found")
+            perms = a.get("permissions", [])
+            self.apk_perms.set(f"{len(perms)} permission" + ("" if len(perms) == 1 else "s"))
             self.apk_frame.pack(fill="x", pady=(10, 0), padx=14, after=self.results_frame)
         else:
             self.apk_frame.pack_forget()
         self.check_verdict()
+
+    def show_permissions(self):
+        if not self.current_apk:
+            return
+        perms = self.current_apk.get("permissions", [])
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - permissions")
+        win.geometry("520x360")
+        win.configure(bg=BG)
+        tk.Label(win, text=f"{self.current_apk.get('package', '')} requests "
+                           f"{len(perms)} permission" + ("" if len(perms) == 1 else "s"),
+                 bg=BG, fg=TEXT1, font=("Helvetica", 11, "bold")) \
+            .pack(anchor="w", padx=12, pady=(10, 6))
+        text = tk.Text(win, bg=SURFACE, fg=TEXT1, relief="flat",
+                       font=("Courier", 10), wrap="none")
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        text.insert("1.0", "\n".join(perms) if perms else "(none)")
+        text.configure(state="disabled")
 
     def copy_ship_note(self):
         sha = self.sha_var.get()
@@ -415,6 +501,8 @@ class GhostVerify(tk.Tk):
         if self.current_apk:
             ver = f" v{self.current_apk.get('version_name', '')} (code {self.current_apk.get('version_code', '')})"
         note = f"{name}{ver} - {self.size_var.get()} - SHA-256 {sha}"
+        if self.current_apk and self.current_apk.get("signer"):
+            note += f"\nSigner SHA-256 {self.current_apk['signer']}"
         self.clipboard_clear()
         self.clipboard_append(note)
         self.status_var.set("Ship note copied: " + note)
