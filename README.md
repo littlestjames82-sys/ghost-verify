@@ -5,7 +5,8 @@ in the export style of [PyUI Builder](https://pyuibuilder.com) — visual
 builder layout, clean generated-style Python, event handlers as methods.
 
 Pure Python standard library (`tkinter` + `hashlib`). No installs, no
-network, no accounts.
+accounts, and no network — except the one fetch you explicitly ask
+for (below), which is a plain GET with no cookies and no auth.
 
 ## Why it exists
 
@@ -53,6 +54,13 @@ python3 ghost_verify.py file.apk   # start with a file loaded
    build), permissions added and removed by name, size delta, and
    the new build's SHA-256 — plus a button that copies the new
    release's ship note.
+9. **Fetch & compare:** paste the URL of the published copy (the
+   downloads-site file, say) and it downloads to a temp file, hashes
+   it, and verdicts against the local file — the pull-back check,
+   without a terminal. Capped at 200 MB. **Paste hash** fills the
+   expected-hash field from the clipboard when it holds a SHA-256.
+   The **session log** records every verification and verdict with
+   timestamps and copies out as a ready-made release record.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
