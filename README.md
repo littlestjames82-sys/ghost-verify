@@ -22,6 +22,21 @@ python3 ghost_verify.py            # then Browse to a file
 python3 ghost_verify.py file.apk   # start with a file loaded
 ```
 
+Or script it — the same engine, no window:
+
+```sh
+python3 ghost_verify.py --info FILE          # JSON profile
+python3 ghost_verify.py --check FILE HASH    # exit 0 = match, 1 = no match
+python3 ghost_verify.py --sums FOLDER        # SHA256SUMS text
+python3 ghost_verify.py --batch SUMS FOLDER  # exit 0 = everything matches
+```
+
+Exit 2 is a usage or file error in every mode, so a build script can
+gate on the result (`--check` after a build, `--batch` before a
+release is announced). One generator detail: when the sums file is
+being written into the folder it describes, the generator excludes
+it — a sums file can never contain its own hash.
+
 1. Pick a file (or pass it on the command line).
 2. It shows SHA-256, SHA-512, MD5, and size from a single read pass,
    with one-tap copy buttons.
