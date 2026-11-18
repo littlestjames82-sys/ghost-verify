@@ -8,6 +8,8 @@
 #       python3 ghost_verify.py --check FILE HASH (exit 0 = match)
 #       python3 ghost_verify.py --sums FOLDER     (SHA256SUMS text)
 #       python3 ghost_verify.py --batch SUMS FOLDER (exit 0 = all match)
+#       python3 ghost_verify.py --audit FOLDER URL  (exit 0 = site matches)
+#       python3 ghost_verify.py --ledger [N]        (hash-chained history)
 # Every APK and package the studio ships carries a SHA-256 in its ship
 # note. Drop the file in here, paste the expected hash, get a verdict.
 
@@ -15,12 +17,14 @@ import hashlib
 import json
 import os
 import queue
+import sqlite3
 import struct
 import sys
 import tempfile
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 import urllib.request
 import zipfile
 import zlib
@@ -59,6 +63,99 @@ def save_recent(paths):
             json.dump({"recent": paths[:5]}, fh)
     except Exception:
         pass
+
+
+LEDGER_PATH = os.path.join(os.path.expanduser("~"), ".ghost-verify.db")
+
+
+def _ledger_db(path=None):
+    db = sqlite3.connect(path or LEDGER_PATH)
+    db.execute("""CREATE TABLE IF NOT EXISTS entries(
+        id INTEGER PRIMARY KEY, ts TEXT, name TEXT, sha256 TEXT,
+        size INTEGER, package TEXT, version_name TEXT, version_code TEXT,
+        signer TEXT, prev_hash TEXT, entry_hash TEXT)""")
+    return db
+
+
+def _entry_hash(prev, ts, name, sha256, size, package, version_code, signer):
+    canon = "|".join([prev or "", ts, name, sha256, str(size),
+                      package or "", str(version_code or ""), signer or ""])
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def ledger_add(prof, path=None, ts=None):
+    """Record one verified file in the hash-chained ledger.
+
+    Returns (entry_hash, warnings, recorded). Re-verifying a file
+    whose name+hash+signer are already recorded is a no-op
+    (recorded=False). The one warning that matters: an APK whose
+    package was previously seen under a DIFFERENT signer — the
+    wrong-keystore build, caught from history. Display-free.
+    """
+    ts = ts or time.strftime("%Y-%m-%dT%H:%M:%S")
+    apk = prof.get("apk") or {}
+    name, sha = prof["name"], prof["sha256"]
+    package = apk.get("package", "") or ""
+    signer = prof.get("signer") or ""
+    db = _ledger_db(path)
+    try:
+        dupe = db.execute(
+            "SELECT entry_hash FROM entries WHERE name=? AND sha256=? AND signer=?",
+            (name, sha, signer)).fetchone()
+        if dupe:
+            return dupe[0], [], False
+        warnings = []
+        if package and signer:
+            past = db.execute(
+                "SELECT DISTINCT signer FROM entries WHERE package=? AND signer<>''",
+                (package,)).fetchall()
+            past_signers = {r[0] for r in past}
+            if past_signers and signer not in past_signers:
+                warnings.append(
+                    f"signer changed for {package}: history has "
+                    f"{sorted(past_signers)[0][:16]}…, this file has {signer[:16]}…")
+        row = db.execute("SELECT entry_hash FROM entries ORDER BY id DESC LIMIT 1").fetchone()
+        prev = row[0] if row else ""
+        eh = _entry_hash(prev, ts, name, sha, prof["size"], package,
+                         apk.get("version_code", ""), signer)
+        db.execute(
+            "INSERT INTO entries(ts,name,sha256,size,package,version_name,"
+            "version_code,signer,prev_hash,entry_hash) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ts, name, sha, prof["size"], package, apk.get("version_name", ""),
+             str(apk.get("version_code", "")), signer, prev, eh))
+        db.commit()
+        return eh, warnings, True
+    finally:
+        db.close()
+
+
+def ledger_verify_chain(path=None):
+    """Recompute the whole chain. Returns (ok, entries, bad_id)."""
+    db = _ledger_db(path)
+    try:
+        rows = db.execute(
+            "SELECT id,ts,name,sha256,size,package,version_code,signer,"
+            "prev_hash,entry_hash FROM entries ORDER BY id").fetchall()
+        prev = ""
+        for r in rows:
+            if r[8] != prev:
+                return False, len(rows), r[0]
+            if _entry_hash(r[8], r[1], r[2], r[3], r[4], r[5], r[6], r[7]) != r[9]:
+                return False, len(rows), r[0]
+            prev = r[9]
+        return True, len(rows), None
+    finally:
+        db.close()
+
+
+def ledger_recent(limit=50, path=None):
+    db = _ledger_db(path)
+    try:
+        return db.execute(
+            "SELECT ts,name,sha256,size,package,version_name,version_code,signer "
+            "FROM entries ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    finally:
+        db.close()
 
 
 def icon_png_bytes(size=48):
@@ -355,7 +452,7 @@ def fetch_to_temp(url, progress=None, cap=200 * 1024 * 1024):
     user pastes a URL and asks. Plain GET, no cookies, no auth.
     Display-free.
     """
-    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/1.9"})
+    req = urllib.request.Request(url, headers={"User-Agent": "GhostVerify/2.0"})
     fd, path = tempfile.mkstemp(prefix="ghostverify-", suffix=".bin")
     done = 0
     with urllib.request.urlopen(req, timeout=30) as resp, os.fdopen(fd, "wb") as out:
@@ -450,6 +547,51 @@ def release_report(folder):
     return "\n".join(lines) + "\n", summary
 
 
+def site_audit(folder, base_url, progress=None):
+    """Compare every top-level file in folder with the copy published
+    at base_url/<name>. Returns (text, summary) in release_report's
+    shape. The audit covers what the folder holds; a static site
+    cannot list files that are published but not present locally,
+    and the report says so. Display-free."""
+    base = base_url.rstrip("/") + "/"
+    names = sorted(f for f in os.listdir(folder)
+                   if os.path.isfile(os.path.join(folder, f)))
+    lines = [f"Site audit — {folder}  vs  {base}", ""]
+    counts = {"match": 0, "differ": 0, "missing": 0}
+    total = max(len(names), 1)
+    for i, name in enumerate(names):
+        local_sha, _5, _m, _s = hash_file(os.path.join(folder, name))
+        url = base + urllib.parse.quote(name)
+        try:
+            remote_path = fetch_to_temp(url)
+            remote_sha, _5, _m, _s = hash_file(remote_path)
+            os.unlink(remote_path)
+            status = "match" if remote_sha == local_sha else "differ"
+        except Exception:
+            status = "missing"
+        counts[status] += 1
+        mark = {"match": "✓ MATCH  ", "differ": "✗ DIFFER ", "missing": "? NOT FOUND"}[status]
+        lines.append(f"{mark} {name}")
+        if progress is not None:
+            progress((i + 1) / total)
+    problems = counts["differ"] + counts["missing"]
+    if not names:
+        problems = 1
+        lines.append("The folder holds no files — nothing was audited.")
+    lines += ["",
+              f"{counts['match']} match · {counts['differ']} differ · "
+              f"{counts['missing']} not found (of {len(names)})",
+              "Note: files published at the site but absent from this "
+              "folder cannot be listed by a static host; the audit "
+              "covers what the folder holds.",
+              "",
+              "Verdict: " + ("READY — the site serves exactly this folder"
+                             if problems == 0 else
+                             f"{problems} problem(s) to look at")]
+    summary = {"sums": None, "apks": [], "signers": set(), "problems": problems}
+    return "\n".join(lines) + "\n", summary
+
+
 def generate_sums(folder, progress=None, exclude=None):
     """Build sha256sum-format text for every file directly in folder
     (top level only, sorted by name). `exclude` names one file to
@@ -498,9 +640,9 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.9 - file hash checker")
-        self.geometry("660x720")
-        self.minsize(580, 620)
+        self.title("Ghost Verify 2.0 - file hash checker")
+        self.geometry("660x760")
+        self.minsize(580, 660)
         self.configure(bg=BG)
         try:
             self._icon = tk.PhotoImage(data=icon_png_bytes())
@@ -560,6 +702,11 @@ class GhostVerify(tk.Tk):
                     self.show_compare(payload[0], payload[1])
                 elif kind == "report_done":
                     self.show_report(payload[0], payload[1])
+                elif kind == "audit_done":
+                    self.set_progress(None)
+                    self.show_report(payload[0], payload[1])
+                elif kind == "audit_progress":
+                    self.set_progress(payload)
                 elif kind == "fetch_progress":
                     self.status_var.set(f"Fetching... {int(payload * 100)}%")
                     self.set_progress(payload)
@@ -583,7 +730,7 @@ class GhostVerify(tk.Tk):
         header.pack(fill="x", pady=(12, 0), **pad)
         tk.Label(header, text="GHOST VERIFY", bg=BG, fg=TEXT1,
                  font=("Helvetica", 17, "bold")).pack(side="left")
-        tk.Label(header, text=" 1.9 ", bg=ACCENT, fg="white",
+        tk.Label(header, text=" 2.0 ", bg=ACCENT, fg="white",
                  font=("Helvetica", 9, "bold")).pack(side="left", padx=(10, 0))
         tk.Label(header, text="Ghost Developer Studio", bg=BG, fg=TEXT2,
                  font=("Helvetica", 9)).pack(side="right")
@@ -719,6 +866,19 @@ class GhostVerify(tk.Tk):
                                    bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                                    relief="flat", font=("Helvetica", 10), padx=10, pady=4)
         self.watch_btn.pack(side="left", padx=(8, 0))
+
+        actions3 = tk.Frame(self, bg=BG)
+        actions3.pack(fill="x", pady=(8, 0), **pad)
+        tk.Button(actions3, text="Site audit",
+                  command=self.start_audit,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left")
+        tk.Button(actions3, text="Ledger",
+                  command=self.show_ledger,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
 
         exp_label = tk.Label(self, text="Expected SHA-256 (from the ship note):",
                              bg=BG, fg=TEXT2, font=("Helvetica", 10))
@@ -868,6 +1028,24 @@ class GhostVerify(tk.Tk):
             self.current_contents = None
             self.apk_frame.pack_forget()
         self.check_verdict()
+        # Record in the hash-chained ledger (fetched temp copies are
+        # already covered by the fetch log lines; skip them here).
+        base = os.path.basename(self.file_var.get().strip())
+        if not base.startswith("ghostverify-"):
+            prof = {"name": base, "sha256": sha, "size": size,
+                    "apk": self.current_apk,
+                    "signer": (self.current_apk or {}).get("signer") or None}
+            try:
+                _eh, warnings, recorded = ledger_add(prof)
+                if recorded:
+                    self.log_event(f"ledger: recorded {base}")
+                for w in warnings:
+                    self.log_event(f"ledger WARNING: {w}")
+                    self.status_var.set("⚠ " + w)
+                    if not self.expected_var.get().strip():
+                        self.set_banner("⚠  " + w, "bad")
+            except Exception:
+                pass  # the ledger must never break a verification
 
     def show_contents(self):
         if not self.current_contents:
@@ -1119,9 +1297,9 @@ class GhostVerify(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def show_report(self, text, summary):
-        self.status_var.set("Release report ready.")
-        self.log_event(f"release report: {summary['problems']} problem(s), "
-                       f"{len(summary['apks'])} APK(s)")
+        self.status_var.set("Report ready.")
+        self.log_event(f"report: {summary['problems']} problem(s), "
+                       f"{len(summary['apks'])} APK(s) profiled")
         win = tk.Toplevel(self)
         win.title("Ghost Verify - release report")
         win.geometry("680x460")
@@ -1147,6 +1325,59 @@ class GhostVerify(tk.Tk):
                   fg="white", activebackground=ACCENT_SOFT, relief="flat",
                   font=("Helvetica", 10, "bold"), padx=12, pady=4) \
             .pack(anchor="w", padx=12, pady=(0, 12))
+
+    # ------------------------------------------------------------ audit & ledger
+    def start_audit(self):
+        folder = filedialog.askdirectory(
+            title="Choose the LOCAL release folder")
+        if not folder:
+            return
+        base = simpledialog.askstring(
+            "Site audit",
+            "Base URL where this folder is published\n"
+            "(for example https://downloads.ghostdeveloperstudio.com/browser/):",
+            parent=self)
+        if not base:
+            return
+        self.status_var.set("Auditing the published copies...")
+
+        def work():
+            try:
+                text, summary = site_audit(
+                    folder, base.strip(),
+                    progress=lambda f: self.events.put(("audit_progress", f)))
+                self.events.put(("audit_done", (text, summary)))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_ledger(self):
+        ok, count, bad = ledger_verify_chain()
+        rows = ledger_recent(50)
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - history ledger")
+        win.geometry("700x440")
+        win.configure(bg=BG)
+        chain_txt = (f"Hash chain intact · {count} entries" if ok
+                     else f"CHAIN BROKEN at entry {bad} · {count} entries")
+        tk.Label(win, text=chain_txt, bg=BG, fg=GOOD if ok else BAD,
+                 font=("Helvetica", 11, "bold")).pack(anchor="w", padx=12, pady=(12, 2))
+        tk.Label(win, text="Every verified file, remembered. An APK whose package "
+                           "appears under a new signer is flagged the moment it is verified.",
+                 bg=BG, fg=TEXT2, font=("Helvetica", 9)) \
+            .pack(anchor="w", padx=12, pady=(0, 6))
+        text = tk.Text(win, bg=SURFACE, fg=TEXT1, relief="flat",
+                       font=("Courier", 9), wrap="none")
+        text.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        lines = []
+        for ts, name, sha, size, package, vn, vc, signer in rows:
+            who = f"{package} v{vn} (code {vc})" if package else name
+            lines.append(f"{ts}  {who}")
+            lines.append(f"    sha {sha[:24]}…  signer {(signer or '—')[:16]}"
+                         f"{'…' if signer else ''}  {size:,} bytes")
+        text.insert("1.0", "\n".join(lines) if lines else "(ledger is empty)")
+        text.configure(state="disabled")
 
     # ------------------------------------------------------------ compare mode
     def start_compare(self):
@@ -1336,21 +1567,44 @@ def cli(argv):
     --check FILE HASH    prints MATCH / NO MATCH; exit 0 only on match
     --sums FOLDER        SHA256SUMS text for the folder's top level
     --batch SUMS FOLDER  per-file verdicts; exit 0 only if all match
+    --audit FOLDER URL   published copies vs the folder; exit 0 if all match
+    --ledger [N]         the hash-chained history ledger (last N entries)
+    --info and --check record what they verify into the ledger.
     Exit 2 is a usage or file error in every mode.
     """
-    if not argv or argv[0] not in ("--info", "--check", "--sums", "--batch"):
+    if not argv or argv[0] not in ("--info", "--check", "--sums", "--batch",
+                                   "--ledger", "--audit"):
         return None
     mode, args = argv[0], argv[1:]
     try:
         if mode == "--info" and len(args) == 1:
             prof = file_profile(args[0])
+            _eh, warnings, _rec = ledger_add(prof)
+            for w in warnings:
+                print(f"warning: {w}", file=sys.stderr)
             print(json.dumps(prof, indent=2, default=str))
             return 0
         if mode == "--check" and len(args) == 2:
-            sha, _s512, _md5, _size = hash_file(args[0])
+            prof = file_profile(args[0])
+            _eh, warnings, _rec = ledger_add(prof)
+            for w in warnings:
+                print(f"warning: {w}", file=sys.stderr)
+            sha = prof["sha256"]
             ok = sha == args[1].strip().lower()
             print(("MATCH " if ok else "NO MATCH ") + sha)
             return 0 if ok else 1
+        if mode == "--ledger" and len(args) <= 1:
+            n = int(args[0]) if args else 20
+            ok, count, bad = ledger_verify_chain()
+            print(f"chain: {'intact' if ok else f'BROKEN at entry {bad}'} · {count} entries")
+            for ts, name, sha, size, package, vn, vc, signer in ledger_recent(n):
+                who = f"{package} v{vn} (code {vc})" if package else name
+                print(f"{ts}  {who}  sha {sha[:16]}…  signer {(signer or '—')[:16]}")
+            return 0 if ok else 1
+        if mode == "--audit" and len(args) == 2:
+            text, summary = site_audit(args[0], args[1])
+            sys.stdout.write(text)
+            return 0 if summary["problems"] == 0 else 1
         if mode == "--sums" and len(args) == 1:
             sys.stdout.write(generate_sums(args[0]))
             return 0
