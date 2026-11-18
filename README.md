@@ -46,6 +46,13 @@ python3 ghost_verify.py file.apk   # start with a file loaded
    from the same manifest. Both were verified field-by-field against
    `apksigner` and `aapt` output on real studio APKs. The ship note
    for an APK gains a second line with the signer fingerprint.
+8. **Compare APKs:** pick the shipped release and the candidate and
+   get the release-over-release verdicts in one window: package
+   match, version direction (a downgrade or a different signer is
+   called out in red, because both refuse to install over the old
+   build), permissions added and removed by name, size delta, and
+   the new build's SHA-256 — plus a button that copies the new
+   release's ship note.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
