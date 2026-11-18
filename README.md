@@ -83,6 +83,15 @@ it — a sums file can never contain its own hash.
     and re-verifies), keyboard shortcuts (Ctrl+O open, Enter in the
     file field verifies, F5 re-verifies, Ctrl+L opens the log), and
     an original ghost app icon drawn in code — no image files.
+11. **Watch folder:** point it at a build output folder and new or
+    changed files verify themselves when they land. A file only
+    fires once its size and timestamp have stayed identical across
+    two polls, so a half-copied APK is never hashed; a rebuild that
+    overwrites a watched file fires again once it settles.
+12. **APK contents:** the APK panel also reports entry count, dex
+    files, and native ABIs (a pure-Java WebView app shows "no
+    native libs"; the GhostIDE universal APK shows arm64-v8a), with
+    a View button listing every entry in the zip.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
