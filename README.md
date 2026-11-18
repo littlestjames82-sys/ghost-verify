@@ -61,6 +61,13 @@ python3 ghost_verify.py file.apk   # start with a file loaded
    expected-hash field from the clipboard when it holds a SHA-256.
    The **session log** records every verification and verdict with
    timestamps and copies out as a ready-made release record.
+10. **The interface itself:** a full-width verdict banner that tints
+    green on a match and red on a mismatch, a slim progress bar
+    under the status line, a Recent row with the last five verified
+    files (persisted in `~/.ghost-verify.json`, one click reopens
+    and re-verifies), keyboard shortcuts (Ctrl+O open, Enter in the
+    file field verifies, F5 re-verifies, Ctrl+L opens the log), and
+    an original ghost app icon drawn in code — no image files.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
