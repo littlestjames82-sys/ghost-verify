@@ -9,9 +9,11 @@
 import hashlib
 import os
 import queue
+import struct
 import sys
 import threading
 import tkinter as tk
+import zipfile
 from tkinter import filedialog, messagebox
 
 # GhostUx tokens (same palette as Ghost Browser)
@@ -72,6 +74,111 @@ def parse_sums(text):
     return out
 
 
+# ------------------------------------------------------------ APK inspection
+# An APK's AndroidManifest.xml is binary XML (AXML). This is a small
+# read-only parser for just the fields a ship check needs: package,
+# versionName, versionCode, min/target SDK. Pure stdlib, display-free.
+
+def _read_pool(data, off):
+    count, _style_count, flags, strings_start = struct.unpack_from("<IIII", data, off + 8)
+    utf8 = bool(flags & 0x100)
+    base = off + strings_start
+    out = []
+    for i in range(count):
+        rel = struct.unpack_from("<I", data, off + 28 + i * 4)[0]
+        pos = base + rel
+        if utf8:
+            n = data[pos]
+            pos += 1
+            if n & 0x80:
+                pos += 1
+            blen = data[pos]
+            pos += 1
+            if blen & 0x80:
+                blen = ((blen & 0x7F) << 8) | data[pos]
+                pos += 1
+            out.append(data[pos:pos + blen].decode("utf-8", "replace"))
+        else:
+            n = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            if n & 0x8000:
+                n2 = struct.unpack_from("<H", data, pos)[0]
+                pos += 2
+                n = ((n & 0x7FFF) << 16) | n2
+            out.append(data[pos:pos + n * 2].decode("utf-16-le", "replace"))
+    return out
+
+
+def apk_info(path):
+    """Return {package, version_name, version_code, min_sdk, target_sdk}
+    for an APK, or None if the file is not a readable APK."""
+    try:
+        with zipfile.ZipFile(path) as zf:
+            if "AndroidManifest.xml" not in zf.namelist():
+                return None
+            data = zf.read("AndroidManifest.xml")
+        if len(data) < 8 or struct.unpack_from("<H", data, 0)[0] != 0x0003:
+            return None
+        pool = None
+        info = {}
+        off = 8
+        while off + 8 <= len(data):
+            ctype, _hsize, csize = struct.unpack_from("<HHI", data, off)
+            if csize <= 0:
+                break
+            if ctype == 0x0001:  # string pool
+                pool = _read_pool(data, off)
+            elif ctype == 0x0102 and pool is not None:  # start element
+                name_idx = struct.unpack_from("<I", data, off + 20)[0]
+                elem = pool[name_idx] if name_idx < len(pool) else ""
+                attr_start, _attr_size, attr_count = struct.unpack_from("<HHH", data, off + 24)
+                attrs_at = off + 16 + attr_start
+                attrs = {}
+                for a in range(attr_count):
+                    ao = attrs_at + a * 20
+                    if ao + 20 > len(data):
+                        break
+                    _ns, aname_idx, raw_idx = struct.unpack_from("<III", data, ao)
+                    dtype = data[ao + 15]
+                    avalue = struct.unpack_from("<I", data, ao + 16)[0]
+                    aname = pool[aname_idx] if aname_idx < len(pool) else ""
+                    if raw_idx != 0xFFFFFFFF and raw_idx < len(pool):
+                        attrs[aname] = pool[raw_idx]
+                    elif dtype == 0x03 and avalue < len(pool):  # STRING
+                        attrs[aname] = pool[avalue]
+                    elif dtype == 0x10:  # INT_DEC
+                        attrs[aname] = avalue
+                    elif dtype == 0x12:  # BOOLEAN
+                        attrs[aname] = bool(avalue)
+                if elem == "manifest":
+                    info["package"] = attrs.get("package", "")
+                    info["version_name"] = str(attrs.get("versionName", ""))
+                    info["version_code"] = attrs.get("versionCode", "")
+                elif elem == "uses-sdk":
+                    info["min_sdk"] = attrs.get("minSdkVersion", "")
+                    info["target_sdk"] = attrs.get("targetSdkVersion", "")
+                if "package" in info and "min_sdk" in info:
+                    break
+            off += csize
+        return info if "package" in info else None
+    except Exception:
+        return None
+
+
+def generate_sums(folder, progress=None):
+    """Build sha256sum-format text for every file directly in folder
+    (top level only, sorted by name). Display-free."""
+    names = sorted(f for f in os.listdir(folder)
+                   if os.path.isfile(os.path.join(folder, f)))
+    lines = []
+    for i, name in enumerate(names):
+        sha, _s512, _md5, _size = hash_file(os.path.join(folder, name))
+        lines.append(f"{sha}  {name}")
+        if progress is not None:
+            progress((i + 1) / max(len(names), 1))
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
 def verify_batch(folder, entries, progress=None):
     """Check every (filename, expected_sha256) against folder.
 
@@ -103,9 +210,9 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.1 - file hash checker")
-        self.geometry("660x520")
-        self.minsize(580, 480)
+        self.title("Ghost Verify 1.2 - file hash checker")
+        self.geometry("660x560")
+        self.minsize(580, 500)
         self.configure(bg=BG)
 
         self.file_var = tk.StringVar(value=start_file)
@@ -141,6 +248,11 @@ class GhostVerify(tk.Tk):
                         self.batch_status.set(f"Checking... {int(payload * 100)}%")
                 elif kind == "batch_done":
                     self.show_batch_results(payload)
+                elif kind == "sums_progress":
+                    self.status_var.set(f"Hashing files for SHA256SUMS... {int(payload * 100)}%")
+                elif kind == "sums_done":
+                    dest, count = payload
+                    self.status_var.set(f"Wrote {count} entries to {dest}")
                 elif kind == "error":
                     messagebox.showerror("Ghost Verify", payload)
                     self.status_var.set("Failed.")
@@ -181,10 +293,24 @@ class GhostVerify(tk.Tk):
 
         results = tk.Frame(self, bg=SURFACE)
         results.pack(fill="x", pady=(10, 0), **pad)
+        self.results_frame = results
         self.result_row(results, "SHA-256", self.sha_var, 0)
         self.result_row(results, "SHA-512", self.sha512_var, 1)
         self.result_row(results, "MD5", self.md5_var, 2)
         self.result_row(results, "Size", self.size_var, 3)
+
+        # APK details appear only when the verified file is an APK.
+        self.apk_pkg = tk.StringVar(value="")
+        self.apk_ver = tk.StringVar(value="")
+        self.apk_code = tk.StringVar(value="")
+        self.apk_sdk = tk.StringVar(value="")
+        self.current_apk = None
+        apkf = tk.Frame(self, bg=SURFACE)
+        self.apk_frame = apkf
+        self.result_row(apkf, "Package", self.apk_pkg, 0)
+        self.result_row(apkf, "Version", self.apk_ver, 1)
+        self.result_row(apkf, "Code", self.apk_code, 2)
+        self.result_row(apkf, "SDK", self.apk_sdk, 3)
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", pady=(10, 0), **pad)
@@ -194,6 +320,11 @@ class GhostVerify(tk.Tk):
             .pack(side="left")
         tk.Button(actions, text="Batch: verify folder vs SHA256SUMS",
                   command=self.start_batch,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
+        tk.Button(actions, text="Generate SHA256SUMS",
+                  command=self.start_generate_sums,
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
@@ -262,6 +393,16 @@ class GhostVerify(tk.Tk):
         self.md5_var.set(md5)
         self.size_var.set(f"{size:,} bytes ({human_size(size)})")
         self.status_var.set("Done.")
+        self.current_apk = apk_info(self.file_var.get().strip())
+        if self.current_apk:
+            a = self.current_apk
+            self.apk_pkg.set(a.get("package", ""))
+            self.apk_ver.set(a.get("version_name", ""))
+            self.apk_code.set(str(a.get("version_code", "")))
+            self.apk_sdk.set(f"min {a.get('min_sdk', '?')} · target {a.get('target_sdk', '?')}")
+            self.apk_frame.pack(fill="x", pady=(10, 0), padx=14, after=self.results_frame)
+        else:
+            self.apk_frame.pack_forget()
         self.check_verdict()
 
     def copy_ship_note(self):
@@ -270,10 +411,36 @@ class GhostVerify(tk.Tk):
             self.status_var.set("Verify a file first, then copy its ship note.")
             return
         name = os.path.basename(self.file_var.get().strip())
-        note = f"{name} - {self.size_var.get()} - SHA-256 {sha}"
+        ver = ""
+        if self.current_apk:
+            ver = f" v{self.current_apk.get('version_name', '')} (code {self.current_apk.get('version_code', '')})"
+        note = f"{name}{ver} - {self.size_var.get()} - SHA-256 {sha}"
         self.clipboard_clear()
         self.clipboard_append(note)
         self.status_var.set("Ship note copied: " + note)
+
+    def start_generate_sums(self):
+        folder = filedialog.askdirectory(title="Choose the folder to hash")
+        if not folder:
+            return
+        dest = filedialog.asksaveasfilename(
+            title="Save the sums file as", initialdir=folder,
+            initialfile="SHA256SUMS")
+        if not dest:
+            return
+        self.status_var.set("Hashing files for SHA256SUMS...")
+
+        def work():
+            try:
+                text = generate_sums(
+                    folder, progress=lambda f: self.events.put(("sums_progress", f)))
+                with open(dest, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                self.events.put(("sums_done", (dest, text.count("\n"))))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ batch mode
     def start_batch(self):
