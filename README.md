@@ -32,6 +32,13 @@ python3 ghost_verify.py file.apk   # start with a file loaded
 5. **Batch mode** verifies a whole folder against a `SHA256SUMS` file
    (the format the release branches carry): pick the sums file, pick
    the folder, get per-file MATCH / DIFFER / MISSING with counts.
+   **Generate SHA256SUMS** does the reverse: hash every file in a
+   folder into a sums file of your own.
+6. **APK inspection:** verify an `.apk` and it also reads the binary
+   manifest (a small built-in AXML parser, no aapt needed) and shows
+   package, versionName, versionCode, and min/target SDK — the
+   "is this really the build the note describes?" check. The ship
+   note for an APK includes its version and code automatically.
 
 Hashing runs on a background thread with a progress readout, so big
 files never freeze the window. The worker never touches the window
