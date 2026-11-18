@@ -216,6 +216,52 @@ def signer_fingerprint(path):
         return None
 
 
+def file_profile(path):
+    """Everything Ghost Verify knows about one file, in one dict."""
+    sha, sha512, md5, size = hash_file(path)
+    prof = {"path": path, "name": os.path.basename(path), "sha256": sha,
+            "sha512": sha512, "md5": md5, "size": size,
+            "apk": apk_info(path), "signer": None}
+    if prof["apk"]:
+        prof["signer"] = signer_fingerprint(path)
+        prof["apk"]["signer"] = prof["signer"] or ""
+    return prof
+
+
+def compare_profiles(old, new):
+    """Release-over-release verdicts between two file_profiles.
+
+    Display-free. Keys: package_match, version (old/new name+code),
+    direction ('upgrade' | 'same' | 'downgrade' | 'unknown'),
+    signer ('same' | 'different' | 'unknown'), perms_added,
+    perms_removed, size_delta.
+    """
+    oa, na = old.get("apk"), new.get("apk")
+    out = {"size_delta": new["size"] - old["size"],
+           "perms_added": [], "perms_removed": []}
+    if not oa or not na:
+        out.update({"package_match": None, "direction": "unknown",
+                    "signer": "unknown", "version": None})
+        return out
+    out["package_match"] = oa.get("package") == na.get("package")
+    out["version"] = (oa.get("version_name", ""), oa.get("version_code", ""),
+                      na.get("version_name", ""), na.get("version_code", ""))
+    try:
+        oc, nc = int(oa["version_code"]), int(na["version_code"])
+        out["direction"] = "upgrade" if nc > oc else ("same" if nc == oc else "downgrade")
+    except (TypeError, ValueError):
+        out["direction"] = "unknown"
+    if old.get("signer") and new.get("signer"):
+        out["signer"] = "same" if old["signer"] == new["signer"] else "different"
+    else:
+        out["signer"] = "unknown"
+    op = set(oa.get("permissions", []))
+    np_ = set(na.get("permissions", []))
+    out["perms_added"] = sorted(np_ - op)
+    out["perms_removed"] = sorted(op - np_)
+    return out
+
+
 def generate_sums(folder, progress=None):
     """Build sha256sum-format text for every file directly in folder
     (top level only, sorted by name). Display-free."""
@@ -261,7 +307,7 @@ def human_size(n):
 class GhostVerify(tk.Tk):
     def __init__(self, start_file=""):
         super().__init__()
-        self.title("Ghost Verify 1.3 - file hash checker")
+        self.title("Ghost Verify 1.4 - file hash checker")
         self.geometry("660x620")
         self.minsize(580, 540)
         self.configure(bg=BG)
@@ -304,6 +350,8 @@ class GhostVerify(tk.Tk):
                 elif kind == "sums_done":
                     dest, count = payload
                     self.status_var.set(f"Wrote {count} entries to {dest}")
+                elif kind == "compare_done":
+                    self.show_compare(payload[0], payload[1])
                 elif kind == "error":
                     messagebox.showerror("Ghost Verify", payload)
                     self.status_var.set("Failed.")
@@ -377,17 +425,22 @@ class GhostVerify(tk.Tk):
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", pady=(10, 0), **pad)
-        tk.Button(actions, text="Copy ship note", command=self.copy_ship_note,
+        tk.Button(actions, text="Ship note", command=self.copy_ship_note,
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left")
-        tk.Button(actions, text="Batch: verify folder vs SHA256SUMS",
+        tk.Button(actions, text="Batch verify",
                   command=self.start_batch,
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
-        tk.Button(actions, text="Generate SHA256SUMS",
+        tk.Button(actions, text="Generate sums",
                   command=self.start_generate_sums,
+                  bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
+                  relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
+            .pack(side="left", padx=(8, 0))
+        tk.Button(actions, text="Compare APKs",
+                  command=self.start_compare,
                   bg=SURFACE, fg=TEXT1, activebackground=ACCENT,
                   relief="flat", font=("Helvetica", 10), padx=10, pady=4) \
             .pack(side="left", padx=(8, 0))
@@ -529,6 +582,94 @@ class GhostVerify(tk.Tk):
                 self.events.put(("error", str(exc)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ compare mode
+    def start_compare(self):
+        old = filedialog.askopenfilename(
+            title="Choose the OLD release (the one already shipped)",
+            filetypes=[("Android packages", "*.apk"), ("All files", "*.*")])
+        if not old:
+            return
+        new = filedialog.askopenfilename(
+            title="Choose the NEW release (the candidate)",
+            filetypes=[("Android packages", "*.apk"), ("All files", "*.*")])
+        if not new:
+            return
+        self.status_var.set("Comparing releases...")
+
+        def work():
+            try:
+                self.events.put(("compare_done",
+                                 (file_profile(old), file_profile(new))))
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_compare(self, old, new):
+        cmp_ = compare_profiles(old, new)
+        self.status_var.set("Comparison ready.")
+        win = tk.Toplevel(self)
+        win.title("Ghost Verify - release comparison")
+        win.geometry("640x430")
+        win.configure(bg=BG)
+        tk.Label(win, text=f"{old['name']}  →  {new['name']}", bg=BG, fg=TEXT1,
+                 font=("Helvetica", 12, "bold")).pack(anchor="w", padx=12, pady=(12, 8))
+        body = tk.Frame(win, bg=SURFACE)
+        body.pack(fill="x", padx=12)
+
+        def row(r, label, value, color=TEXT1):
+            tk.Label(body, text=label, bg=SURFACE, fg=TEXT2,
+                     font=("Helvetica", 10, "bold"), width=11, anchor="w") \
+                .grid(row=r, column=0, padx=10, pady=5, sticky="w")
+            tk.Label(body, text=value, bg=SURFACE, fg=color,
+                     font=("Helvetica", 10), anchor="w", wraplength=470,
+                     justify="left").grid(row=r, column=1, sticky="w")
+
+        if cmp_["package_match"] is None:
+            row(0, "Package", "At least one file is not a readable APK", BAD)
+        else:
+            row(0, "Package",
+                new["apk"].get("package", "") + ("  (same)" if cmp_["package_match"] else "  — DIFFERENT from the old release"),
+                GOOD if cmp_["package_match"] else BAD)
+        if cmp_["version"]:
+            on, oc, nn, nc = cmp_["version"]
+            arrow = {"upgrade": "▲ upgrade", "same": "= same code — Android will treat this as the same version",
+                     "downgrade": "▼ DOWNGRADE — a lower code will not install over the old one",
+                     "unknown": "?"}[cmp_["direction"]]
+            row(1, "Version", f"v{on} (code {oc})  →  v{nn} (code {nc})   {arrow}",
+                GOOD if cmp_["direction"] == "upgrade" else (TEXT1 if cmp_["direction"] == "same" else BAD))
+        signer_txt = {"same": f"SAME signer ({(new.get('signer') or '')[:16]}…) — installs over the old release",
+                      "different": "DIFFERENT signer — this build will NOT install over the old one",
+                      "unknown": "could not be read on one side"}[cmp_["signer"]]
+        row(2, "Signer", signer_txt, GOOD if cmp_["signer"] == "same" else BAD)
+        pa, pr = cmp_["perms_added"], cmp_["perms_removed"]
+        if pa or pr:
+            bits = []
+            if pa: bits.append("added: " + ", ".join(p.replace("android.permission.", "") for p in pa))
+            if pr: bits.append("removed: " + ", ".join(p.replace("android.permission.", "") for p in pr))
+            row(3, "Perms", " · ".join(bits), TEXT1)
+        else:
+            row(3, "Perms", "unchanged", GOOD)
+        d = cmp_["size_delta"]
+        row(4, "Size", f"{old['size']:,}  →  {new['size']:,} bytes  ({'+' if d >= 0 else ''}{d:,})")
+        row(5, "New SHA", new["sha256"])
+
+        def copy_new_note():
+            note = (f"{new['name']} v{new['apk'].get('version_name', '')} "
+                    f"(code {new['apk'].get('version_code', '')}) - "
+                    f"{new['size']:,} bytes - SHA-256 {new['sha256']}")
+            if new.get("signer"):
+                note += f"\nSigner SHA-256 {new['signer']}"
+            self.clipboard_clear()
+            self.clipboard_append(note)
+            self.status_var.set("New release ship note copied.")
+
+        tk.Button(win, text="Copy ship note for the NEW release",
+                  command=copy_new_note, bg=ACCENT, fg="white",
+                  activebackground=ACCENT_SOFT, relief="flat",
+                  font=("Helvetica", 10, "bold"), padx=12, pady=5) \
+            .pack(anchor="w", padx=12, pady=(12, 0))
 
     # ------------------------------------------------------------ batch mode
     def start_batch(self):
